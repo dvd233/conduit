@@ -55,6 +55,7 @@ import {
 } from '../ingress/listener';
 import { parseEngineManifest } from '../ingress/manifest';
 import type { RedriveLaunch } from '../ingress/recovery';
+import type { SpawnFailedAlert } from '../ingress/spawn';
 import { socketDialOptions } from '../ingress/socket-proxy';
 import { verifySlackSignature } from '../ingress/adapters/slack-events';
 import type { SocketSeam } from '../ingress/adapters/slack-socket';
@@ -67,6 +68,15 @@ import { parseIngressBinding } from '../ingress/binding';
 export interface CliIO {
   out(line: string): void;
   err(line: string): void;
+}
+
+/**
+ * Render the human-readable ingress failure line consumed by existing local
+ * failure relays. Keep the field names and order stable until a delivering
+ * alert channel replaces this stderr integration (issue #19 / #18).
+ */
+export function formatIngressAlert(alert: SpawnFailedAlert): string {
+  return `[ingress alert] flow=${alert.flowId} event=${alert.eventId} channel=${alert.channel}: ${alert.reason}`;
 }
 
 export interface PrereqProbe {
@@ -2478,9 +2488,7 @@ export function buildProductionDeps(): CliDeps {
           resumeSpawn: spawnConduitResume,
           // Alert seam: surface spawn failures to stderr.
           alert: async (a) => {
-            io.err(
-              `[ingress alert] flow=${a.flowId} event=${a.eventId} channel=${a.channel}: ${a.reason}`,
-            );
+            io.err(formatIngressAlert(a));
           },
           // WI-576: registry-aware so a malformed harness station in an
           // ingress-triggered flow fails boot (FLOW_LOAD_FAILED) rather than

@@ -41,7 +41,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, type ConduitDB } from '../persistence/db';
 import type { ModelAdapter } from '../worker/adapter';
-import { main, type CliDeps, type CliIO } from './main';
+import { formatIngressAlert, main, type CliDeps, type CliIO } from './main';
 import type { ListenerConfig, StartListenerResult, Listener } from '../ingress/listener';
 
 function makeIO(): CliIO & { lines: string[]; errors: string[] } {
@@ -97,6 +97,26 @@ function makeDeps(over: DepsOverride = {}): CliDeps {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Issue #19 — downstream failure relays parse this stderr line until #18 ships
+// a delivering alert channel. Keep the fields and their order fixed so a format
+// change fails CI instead of silently stopping alert delivery.
+// ---------------------------------------------------------------------------
+describe('conduit listen — stderr alert integration contract (#19)', () => {
+  it('pins the flow, event, channel, and reason fields in that exact order', () => {
+    expect(
+      formatIngressAlert({
+        flowId: 'order-processing',
+        eventId: 'evt-abc123',
+        channel: '#conduit-alerts',
+        reason: 'conduit run exited with code 1',
+      }),
+    ).toBe(
+      '[ingress alert] flow=order-processing event=evt-abc123 channel=#conduit-alerts: conduit run exited with code 1',
+    );
+  });
+});
 
 // ---------------------------------------------------------------------------
 // AC1 — main() dispatches 'listen' to cmdListen, which starts the WI-410
