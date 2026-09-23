@@ -1,0 +1,216 @@
+# Nitpick PR review for FORK pull requests — label-triggered, advisory.
+#
+# The complement of pr-review.yml. That file gates on `head.repo.fork == false`
+# so maintainer secrets never touch fork code, which is correct and also means
+# external contributions get no automated review at all. This closes that gap
+# without moving the secrets boundary. The reviewer itself is nitpick-run.yml,
+# shared by both callers.
+#
+# ── WHY NOT workflow_run ───────────────────────────────────────────────────
+# The usual recipe for reviewing a fork is a two-stage split: an unprivileged
+# `pull_request` job builds an artifact, a `workflow_run` job with secrets
+# consumes it. That is right when the privileged half needs something only a
+# fork checkout can produce. It needs nothing of the kind here. Nitpick
+# consumes two inputs and neither requires fork code:
+#
+#   the diff     — served by the pulls API from the BASE repository.
+#   the context  — CLAUDE.md / AGENTS.md, which MUST come from base. Taking
+#                  them from the fork would let a contributor rewrite the
+#                  conventions the reviewer is told to respect, inside the pull
+#                  request the reviewer is judging. That is a direct prompt
+#                  injection, and `checkout_ref: base.sha` below is the line
+#                  that prevents it.
+#
+# So the artifact hand-off would carry nothing, and a workflow_run job that
+# trusts artifact contents is strictly more attack surface than one that reads
+# the API. `pull_request_target` with NO fork checkout is the smaller design;
+# triage.yml:53 makes the same call for the same reason.
+#
+# NEVER pass a head ref as checkout_ref from this file.
+#
+# ── WHY A LABEL, AND NOT AUTOMATIC ─────────────────────────────────────────
+# Anyone with a GitHub account can open a pull request and push to it. On an
+# automatic trigger every push is a model run on your gateway key, bounded only
+# by a cap someone guessed at. A label inverts that: nothing runs until a
+# maintainer asks, and the judgement of "is this worth reviewing" stays with
+# the person paying for it.
+#
+# Re-running: remove the label and add it again. This workflow deliberately
+# does NOT remove the label itself, because that needs `issues: write` on a
+# design whose whole point is that it holds `pull-requests: write` and nothing
+# else.
+#
+# ── THE LABEL COUPLING ─────────────────────────────────────────────────────
+# triage.yml applies labels with an `issues: write` token, driven by a model
+# reading attacker-authored text. Its header states that the blast radius of a
+# label write is the union of every workflow triggered by `labeled`, and that
+# the union was empty. THIS FILE IS THAT UNION NOW; triage.yml has been updated
+# to say so. Two independent things keep that model out of here:
+#
+#   1. NAMING. src/triage/apply-triage.ts:134 bounds writes to TYPE_VALUES
+#      (bug / documentation / enhancement / question) intersected with the AUTO
+#      tier. `nitpick` is outside that set. This is a convention an unrelated
+#      edit could break.
+#   2. IDENTITY. The labeller must appear in LABELLERS below. No API call, so
+#      there is no permission scope to get wrong and no endpoint that can 403
+#      the guard into either failing open or never running. github-actions[bot]
+#      is not on the list and cannot add itself to it.
+#
+# Do not drop (2) on the grounds that (1) covers it, or replace it with a
+# collaborator-permission lookup: that endpoint requires push access to answer,
+# which is not a scope this job should hold, and it reports `read` rather than
+# an error for accounts with no access at all.
+name: Nitpick PR Review (fork)
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+# Re-labelling while a review is running supersedes it rather than stacking.
+concurrency:
+  group: nitpick-fork-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Only values a STEP reads belong here. GitHub does not expand `env` in a
+# job-level `if:` or in a reusable workflow's `with:`, so the label name and the
+# diff cap are written as literals at their use sites rather than as env vars
+# that would look authoritative and be ignored.
+env:
+  # Who may spend money here. Comma-separated logins; override without editing
+  # this file by setting the NITPICK_LABELLERS repository variable.
+  LABELLERS: ${{ vars.NITPICK_LABELLERS || 'queso' }}
+  # Runs per UTC day. A backstop only, now that the trigger is manual: it
+  # bounds a slip of the hand or a compromised maintainer account, not ordinary
+  # contributor traffic.
+  DAILY_CAP: 20
+
+jobs:
+  # ── Guards. No secrets, no checkout, no network beyond the GitHub API. ─────
+  guard:
+    # Fork pull requests only — pr-review.yml reviews internal branches
+    # automatically, and running both would review the same diff twice.
+    #
+    # There is no author_association filter. One stood here to avoid
+    # overlapping pr-review.yml's automatic coverage; with a manual trigger the
+    # maintainer applying the label has already made that call, and a
+    # COLLABORATOR's pull request from their own fork is exactly a case
+    # pr-review.yml does not cover.
+    # 'nitpick' is a literal because `env` does not expand in a job-level `if:`.
+    # It must stay OUTSIDE src/triage/apply-triage.ts's TYPE_VALUES — see the
+    # LABEL COUPLING note above.
+    if: >-
+      github.event.label.name == 'nitpick' &&
+      github.event.pull_request.head.repo.fork == true &&
+      github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    permissions:
+      # Counting this workflow's own runs for the daily cap. Nothing else.
+      actions: read
+    outputs:
+      proceed: ${{ steps.cap.outputs.proceed }}
+    steps:
+      - name: Verify the labeller
+        env:
+          # Via env. A login is attacker-chosen text on a fork event.
+          SENDER: ${{ github.event.sender.login }}
+        run: |
+          set -euo pipefail
+          # Exact match against a comma-separated list, anchored on both sides
+          # so "queso" does not match "queso-attacker" or "notqueso".
+          case ",${LABELLERS// /}," in
+            *",$SENDER,"*) echo "$SENDER may request a review" ;;
+            *) echo "::error::$SENDER is not in NITPICK_LABELLERS"; exit 1 ;;
+          esac
+
+      - name: Daily cap
+        id: cap
+        # FAILS CLOSED: if the count cannot be read, the job skips rather than
+        # runs. An API blip should cost a missing review, never an uncapped bill.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          skip() { echo "proceed=false" >>"$GITHUB_OUTPUT"; echo "SKIP: $1"; exit 0; }
+
+          since="$(date -u +%Y-%m-%d)"
+          # Count runs that actually did work, PLUS runs still in flight.
+          #
+          # A run gated out by the job `if` above ends as 'skipped' and must
+          # not consume a slot: every pull_request_target event reaches this
+          # workflow, so counting raw runs would let ordinary traffic starve
+          # the reviews this file is for.
+          #
+          # In-flight runs count because a conclusion is only written when a
+          # run ENDS. Counting concluded runs alone makes this a read-then-act
+          # race across pull requests: label several at once and every guard
+          # reads the same total, every one admits, and the cap is overshot by
+          # however many are running concurrently. That burst is not a
+          # hypothetical edge — it is precisely the shape of the slip of the
+          # hand or the compromised maintainer account this cap exists to
+          # bound. This run excludes itself, being in flight by the time this
+          # step executes.
+          #
+          # Serializing the workflow on one repository-wide concurrency group
+          # would close the same race, but GitHub holds at most one run pending
+          # per group: a third label would cancel the queued review outright,
+          # and a cancelled run still consumes a slot below. Counting drops
+          # nothing, and leaves the per-PR supersede above intact.
+          runs="$(gh api --paginate \
+            "repos/$REPO/actions/workflows/pr-review-fork.yml/runs?created=>=$since&per_page=100" \
+            --jq '[.workflow_runs[]
+                   | select((.id|tostring) != env.GITHUB_RUN_ID)
+                   | select(.conclusion=="success" or .conclusion=="failure" or .conclusion=="cancelled"
+                            or .status=="queued" or .status=="in_progress" or .status=="waiting"
+                            or .status=="pending" or .status=="requested")] | length' \
+            2>/dev/null | paste -sd+ | bc 2>/dev/null)" || skip "cannot read run history — failing closed"
+          [ -n "$runs" ] || skip "cannot read run history — failing closed"
+
+          echo "used $runs of $DAILY_CAP today"
+          [ "$runs" -lt "$DAILY_CAP" ] || skip "daily cap reached ($runs/$DAILY_CAP)"
+          echo "proceed=true" >>"$GITHUB_OUTPUT"
+
+  # ── The review. Same reviewer the internal branches get. ──────────────────
+  review:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    permissions:
+      # Read the base tree, write one review. Deliberately NOT issues:write
+      # (labels are triage.yml's blast radius) and NOT contents:write. A
+      # reusable workflow cannot widen these, so this line is the ceiling on
+      # what a poisoned diff can achieve: one wrong review comment.
+      contents: read
+      pull-requests: write
+      packages: read
+    uses: ./.github/workflows/nitpick-run.yml
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+      # BASE, never the head. See the header.
+      checkout_ref: ${{ github.event.pull_request.base.sha }}
+      # ADVISORY. The reviewed text is written by the person being reviewed, so
+      # a REQUEST_CHANGES verdict is not trustworthy enough to stop a merge and
+      # a passing one is not trustworthy enough to allow one. Never mark this
+      # job a required check.
+      advisory: true
+      # Literal: `env` does not expand in a reusable workflow's `with:`.
+      max_diff_bytes: 400000
+    secrets:
+      conduit_api_key: ${{ secrets.FIREWORKS_AI_API_KEY }}
+      ghcr_read_pat: ${{ secrets.GHCR_READ_PAT }}
+
+  # ── Tell the contributor why nothing happened. ────────────────────────────
+  too-large:
+    needs: review
+    if: needs.review.outputs.too_large == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="Automated review skipped: this diff is larger than the reviewer's size cap. Splitting it into focused pull requests will get it reviewed, and is easier to land." >/dev/null

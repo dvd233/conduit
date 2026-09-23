@@ -1,6 +1,6 @@
 {
   "name": "conduit",
-  "version": "1.0.3",
+  "version": "1.1.2",
   "description": "A deterministic quality-control runtime for AI workflows.",
   "private": true,
   "license": "MIT",
@@ -31,6 +31,7 @@
   "scripts": {
     "test": "bun test src/ --pass-with-no-tests",
     "test:blackbox": "bun test blackbox/ --pass-with-no-tests",
+    "test:mutation": "bun scripts/mutation-check.ts",
     "docs:check": "scripts/docs-check.sh --staged",
     "docs:check:all": "drift check",
     "docs:governing": "bun scripts/docs-governing.ts",

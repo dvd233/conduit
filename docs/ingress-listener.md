@@ -42,7 +42,10 @@ External Event (webhook/Slack)
 Conduit run launched OR logged as rejected/duplicate
     ↓
 [Child exit, asynchronously]
-  - Non-zero: spawn_state='failed' + alert + 'spawn_failed' log entry
+  - Non-zero: spawn_state='failed' + alert + 'spawn_failed' log entry — unless
+    the run PARKED behind a provider rate limit (`runs.outcome='parked'`, exit
+    code 1): then the row stays `'spawned'`, a `'parked'` log entry is written,
+    and the listener resumes the run once its gate passes (see Re-drive logic)
   - Clean: nothing further; the row stays 'spawned'
   - Either way: release the run slot
 ```
@@ -305,7 +308,10 @@ Records every event ever seen. Columns:
 `spawned` means **launched**, not "ran to a clean exit." A run that
 dies after launch moves the row back to `failed` from the exit watcher, so the
 bounded re-drive still picks it up; a run that is still executing sits in
-`spawned` with its run slot held.
+`spawned` with its run slot held. A run that **parks** behind a provider rate
+limit (its own row says `status='halted', outcome='parked'`) also exits
+non-zero but is not a failure: it stays `spawned` and is **resumed**, never
+re-driven — a park is a run-level fact on the `runs` row, not a launch state.
 
 ### State machine transitions
 
@@ -326,8 +332,9 @@ bounded re-drive still picks it up; a run that is still executing sits in
  [child exits] (try again, bounded)
    /      \
  code 0   code≠0 → 'failed' (+ alert, bounded re-drive)
-   ↓
- (done)
+   ↓          ↳ run parked (runs.outcome='parked') → stays 'spawned'
+ (done)         (+ 'parked' log entry, one informational alert,
+                 `conduit resume` from the sweep once the gate passes)
 ```
 
 ### Re-drive logic
@@ -356,6 +363,55 @@ On listener startup, `redriveOnBoot`:
    failure is the loudest case: the row is excluded from every future sweep, so
    its alert is the only thing that will surface the event again.
 
+**Parked runs are resumed, not re-driven.** A run that halted behind a provider
+rate limit exits 1, but its `runs` row reads `status='halted', outcome='parked'`
+and its cards are `ready` behind a future `release_at`. Both exit watchers
+check that (the runs row, confirmed against the cards) before marking failed:
+a parked run keeps its row `spawned`, writes a `'parked'` log entry naming the
+run id and the gate (ISO-8601 UTC), and fires one informational alert per
+event (the first park only — a long reset is chunked into several park cycles
+and the channel should not hear each one; a cap that never clears ends loudly
+instead, see below). It is never re-driven — `conduit run --run-id <existing>` only prints
+the run's state — so `spawn_attempts` is untouched.
+
+After the boot re-drive, and again after every periodic sweep (the same
+schedule and the same slot-release kick — no second timer), the listener
+resumes every parked ingress run whose gate has passed with
+`conduit resume <flow.yaml> --run <runId>`, soonest gate first. Resumes draw
+from the run-slot pool **without** the HITL bypass: a rate limit is exactly
+the wrong moment to let N parked runs stampede a saturated model box, so the
+first run to find no free slot ends the sweep and the rest wait for the kick.
+A resume already in flight for the same run is suppressed (`'duplicate'`).
+When the resumed child exits the run is re-inspected: complete → an
+`'accepted'` entry; parked again (the per-park cap chunks a long reset into
+several cycles) → another `'parked'` entry, no new alert, and the next due
+sweep picks it up; neither → **now** it is a failure: `'failed'` + alert +
+`'spawn_failed'`, exactly as a dead re-driven child — and the parked sweep then
+leaves it to the attempt-capped re-drive sweep, since only `spawned` events are
+resume candidates. That hand-off bounds the loop: a resume that fails before it
+drives the run (lease conflict, preflight, missing flow file) leaves the run
+parked with its gate in the past, and re-resuming it every tick would never
+end; instead the re-drive sweep's `conduit run --run-id` no-op flips the row
+back to `spawned` while counting an attempt, so the cycle is bounded by the
+cap. A parked run with no ingress attribution (a CLI-triggered run) is not the
+listener's to resume.
+
+A resume is also skipped for any event whose launch is already in flight in
+this process: the boot re-drive resolves on **launch** and marks the row
+`spawned` before the parked sweep runs, so a row it just re-drove is otherwise
+immediately a resume candidate and the two drivers race for the run lease.
+The re-drive sweep guards the same way, but registers its slot under the event
+id while a resume registers under `parked-resume:<runId>`, so the parked sweep
+checks `inFlight(eventId)` itself.
+
+**The park loop terminates.** A park spends no execution attempt, so none of
+the four rework guards bounds it, and this sweep would otherwise resume a
+permanently-capped run forever on one alert. The kernel bounds it instead: a
+card that parks `MAX_CONSECUTIVE_RATE_LIMIT_PARKS` times in a row without
+making progress hard-pauses to `hold`. A held card is not parked, so the run
+drops off this sweep and its next exit takes the ordinary failure path —
+`'failed'` + alert + `'spawn_failed'`.
+
 ### Attempt cap semantics
 
 Default cap: 3 attempts (configurable).
@@ -383,6 +439,7 @@ Append-only journal of all event outcomes. Columns:
   - `'rejected_malformed'` — Body unparseable
   - `'spawn_failed'` — Spawn succeeded, conduit run had an error
   - `'redriven'` — Re-drive attempt on restart
+  - `'parked'` — The launched run halted parked behind a provider rate limit (`runs.outcome='parked'`); the row stays `spawned` and the sweep resumes it once its gate passes. Written on every park; the reason names the run id and the gate as ISO-8601 UTC
   - `'queued'` — Accepted, but all run slots busy (`max_concurrent_runs`); launches via the re-drive sweep as slots free
 - `reason` (TEXT, nullable): Human-readable reason
 - `attributes_json` (TEXT, nullable): Event attributes (secret-filtered)
@@ -401,6 +458,13 @@ Reason: Conduit run exited with non-zero status
 ```
 
 Alert destination: Per-flow `channels.egress[0].target` (if declared), else listener-global fallback channel.
+
+A **parked** run sends one informational alert per park sequence — the reason
+starts with `parked` and names the run id and the gate time — so the channel
+learns the run is waiting and will resume on its own. It is keyed on the
+event's existing `'parked'` log entries, so a run that re-parks across several
+resume/park cycles does not repeat it, and it never marks the event failed. A
+resume that ends with the run neither complete nor parked alerts as a failure.
 
 ## Examples
 

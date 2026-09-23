@@ -130,6 +130,11 @@ function filterValue(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Strip secrets out of an attribute bag before it is persisted to the journal.
+ * A sensitive key drops its whole subtree, not just a scalar, so a token nested
+ * under `credentials` cannot survive by being one level deeper.
+ */
 export function filterAttributes(attrs: Record<string, unknown>): Record<string, unknown> {
   const safe: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(attrs)) {
@@ -519,6 +524,11 @@ export type IngressOutcome =
   | 'rejected_ambiguous'
   | 'spawn_failed'
   | 'redriven'
+  // Issue #7: the launched run halted PARKED behind a provider rate limit
+  // (runs.outcome = 'parked'). Not a failure — the row stays 'spawned' and the
+  // listener resumes the run once its gate passes. Logged on every park; the
+  // alert for it fires once per event (see ingress/parked.ts recordPark).
+  | 'parked'
   // The original listener-backpressure work: accepted but no run slot free — the row stays 'accepted' in
   // ingress_events and the re-drive sweep launches it as slots free.
   | 'queued';
@@ -545,6 +555,8 @@ export interface StoredIngressLogEntry {
 
 export interface IngressLogFilter {
   outcome?: IngressOutcome;
+  /** Only rows for this event id (issue #7: the once-per-event park alert keys on the log). */
+  eventId?: string;
   /** Only return rows with id strictly greater than this cursor (keyset pagination). */
   sinceId?: number;
   /** Cap the number of rows returned. Defaults to DEFAULT_INGRESS_LOG_LIMIT. */
@@ -568,6 +580,7 @@ const VALID_INGRESS_OUTCOMES: ReadonlySet<string> = new Set<IngressOutcome>([
   'rejected_ambiguous',
   'spawn_failed',
   'redriven',
+  'parked',
   'queued',
 ]);
 
@@ -648,6 +661,12 @@ interface RawIngressEventRow {
   substrate_json: string | null;
 }
 
+/**
+ * Project a raw ingress_events row onto the record the listener reads, naming
+ * the `spawn_state` column's string as the state union. Attribution columns
+ * (`flow_id`, `flow_path`, `run_id`) are nullable because a pre-v9 row predates
+ * them — callers must handle the null rather than assume an owning flow.
+ */
 function toIngressEventRecord(row: RawIngressEventRow): IngressEventRecord {
   return {
     event_id: row.event_id,
@@ -1276,6 +1295,10 @@ class ConduitDBImpl implements ConduitDB {
     if (filter?.outcome) {
       conditions.push('outcome = $outcome');
       params.$outcome = filter.outcome;
+    }
+    if (filter?.eventId !== undefined) {
+      conditions.push('event_id = $eventId');
+      params.$eventId = filter.eventId;
     }
     if (filter?.sinceId !== undefined) {
       conditions.push('id > $sinceId');

@@ -170,8 +170,17 @@ export function attemptClaim(db: ConduitDB, req: ClaimRequest): ClaimResult {
             $pid: req.pid ?? null,
           });
 
+        // `release_at` is CLEARED with the claim: the gate it described has been
+        // passed, and this is the transaction that passes it. Nothing else ever
+        // cleared the column, so a card that parked once carried a stale past
+        // value for the rest of its life — harmless to the release gate itself
+        // (planTick compares `> now`), but every OTHER reader of the column has
+        // to special-case it. The ingress parked sweep is the one that bit:
+        // it takes MIN(release_at) over a run's ready cards to decide when a
+        // parked run is due, so one stale value made a genuinely parked run
+        // read as due immediately and churn a resume per tick.
         stateDb
-          .prepare("UPDATE cards SET status = 'claimed' WHERE run_id = $run_id AND id = $id")
+          .prepare("UPDATE cards SET status = 'claimed', release_at = NULL WHERE run_id = $run_id AND id = $id")
           .run({ $run_id: runId, $id: req.cardId });
 
         return { ok: true };

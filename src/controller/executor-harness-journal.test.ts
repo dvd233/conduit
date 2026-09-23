@@ -86,6 +86,38 @@ function makeHarness(
 }
 
 // ---------------------------------------------------------------------------
+// issue #26 AC5 — a harness adapter that THROWS but still attaches usage to
+// the error (a `BilledHarnessError`), mirroring what harness-adapter-claude.ts
+// / harness-adapter-codex.ts now do on a recoverable classified failure
+// ('harness-nonzero-exit', 'harness-rate-limited', 'harness-timeout' when
+// recoverable). `usage: undefined` reproduces the pre-#26 shape (a throw that
+// genuinely cannot recover a figure, e.g. a claude wall-clock timeout).
+// ---------------------------------------------------------------------------
+
+function makeHarnessThrowingWithUsage(
+  usage: UsageReport | undefined,
+  opts: { code?: string; name?: string } = {},
+): { adapter: HarnessAdapter; calls: HarnessInvocation[] } {
+  const calls: HarnessInvocation[] = [];
+  const adapter: HarnessAdapter = {
+    name: opts.name ?? 'fake-harness',
+    reportsUsage: true,
+    canRestrictTools: true,
+    async probeBinary() {
+      return { present: true };
+    },
+    async invoke(call: HarnessInvocation) {
+      calls.push(call);
+      throw Object.assign(
+        new Error('claude-headless: exited with code 1'),
+        { code: opts.code ?? 'harness-nonzero-exit', ...(usage !== undefined ? { usage } : {}) },
+      );
+    },
+  };
+  return { adapter, calls };
+}
+
+// ---------------------------------------------------------------------------
 // Flow fixture — one `coder` harness station, configurable budgets.
 // ---------------------------------------------------------------------------
 
@@ -170,6 +202,37 @@ function makeIO(): { io: { out: (l: string) => void; err: (l: string) => void };
 
 async function run(flow: FlowConfig, registry: HarnessRegistry, io: { out: (l: string) => void; err: (l: string) => void }, at = 1000): Promise<void> {
   await runExecutor({ db: db!, flow, now: SECONDS(at), adapter: throwingModel, io, harnessRegistry: registry } as RunEngineArgs);
+}
+
+/**
+ * Drive the executor on a VIRTUAL clock advanced by the injected sleep, for
+ * the one test here that PARKS a card.
+ *
+ * The frozen-clock `run()` above is right for every other test in this file,
+ * but a park makes the run loop sleep until the release gate opens, and a
+ * frozen clock means that gate never arrives. Without this the park test does
+ * not fail cleanly when the fold regresses: it HANGS to the 5s test timeout,
+ * which is weaker evidence than an assertion and slow to diagnose. Same idiom
+ * as executor-harness-rate-limit.test.ts's virtualClock.
+ */
+async function runVirtual(
+  flow: FlowConfig,
+  registry: HarnessRegistry,
+  io: { out: (l: string) => void; err: (l: string) => void },
+  startSeconds = 1000,
+): Promise<void> {
+  let clock = startSeconds;
+  await runExecutor({
+    db: db!,
+    flow,
+    now: () => clock,
+    sleep: async (ms: number) => {
+      clock += Math.max(1, Math.ceil(ms / 1000));
+    },
+    adapter: throwingModel,
+    io,
+    harnessRegistry: registry,
+  } as unknown as RunEngineArgs);
 }
 
 // ---------------------------------------------------------------------------
@@ -372,5 +435,127 @@ describe('WI-567 AC5 — new journal columns are additive (existing rows survive
     const span = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'legacy')[0]!;
     expect(span.adapter ?? null).toBeNull();
     expect(span.usageUnknown ?? false).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #26 AC5 (maker path parity) — a thrown invocation was still BILLED for
+// whatever it did before it died. Before this fix, executeHarnessStation's
+// catch unconditionally journaled usageUnknown:true and folded nothing, even
+// when the adapter attached a real figure to the throw (harness-adapter-claude
+// / -codex now do this for a recoverable classified failure).
+// ---------------------------------------------------------------------------
+
+describe('issue #26 AC5 (maker path) — a thrown invocation that carried usage is billed, not written off', () => {
+  it('folds the thrown usage into the run budget and journals the real figure instead of usageUnknown', async () => {
+    db = openDb();
+    const { adapter } = makeHarnessThrowingWithUsage({ tokens: 77, cost: 0.03 });
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(dir, registry, { maxAttempts: 1 });
+    seedCard(db, 'entry');
+    const { io } = makeIO();
+
+    await run(flow, registry, io);
+
+    // Cap exhausted at 1 attempt — scrapped, same as any other named failure.
+    expect(getCard(db)?.lane).toBe('scrap');
+
+    const spans = harnessSpans(db);
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.usageUnknown).toBe(false);
+
+    const usage = db.getStationUsage('entry', 'coder', 0);
+    expect(usage).not.toBeNull();
+    const u = usage as Record<string, number | string>;
+    expect(Number(u['gen_ai.usage.input_tokens']) + Number(u['gen_ai.usage.output_tokens'])).toBe(77);
+    expect(u['cost_usd']).toBe(0.03);
+
+    // NOTE: getRunUsageTotals aggregates the JOURNAL, so it is NOT a
+    // discriminator for the fold — it reports the same figure whether or not
+    // foldHarnessUsage ever ran. Kept as a journal assertion only; the
+    // budget fold is proven by the andon test below, which is the one that
+    // fails when the fold is removed.
+    expect(db.getRunUsageTotals(DEFAULT_RUN_ID)).toEqual({ tokens: 77, costUsd: 0.03 });
+  });
+
+  it('the thrown usage reaches tokensSpent — a second card never dispatches because the andon tripped', async () => {
+    db = openDb();
+    // The real discriminator for the FOLD, mirroring the gateless-maker andon
+    // test above. Each attempt throws after being billed 100 tokens against a
+    // 50-token run budget, so card 'entry' alone busts it. If the thrown usage
+    // folds, the andon trips and halts the run before 'entry2' is ever
+    // dispatched; if it does NOT fold, tokensSpent stays 0, no andon fires,
+    // and BOTH cards run to a scrap. The adapter's own call log is what
+    // separates the two — it cannot be satisfied by a journal row.
+    const { adapter, calls } = makeHarnessThrowingWithUsage({ tokens: 100, cost: 0.1 });
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(dir, registry, { maxAttempts: 1, runMaxTokens: 50 });
+    seedCard(db, 'entry');
+    seedCard(db, 'entry2');
+    const { io, err } = makeIO();
+
+    await run(flow, registry, io);
+
+    const errText = err.join('\n');
+    expect(errText).toMatch(/andon/i);
+    expect(errText).toMatch(/token/i);
+    // Exactly one invocation: the run halted before the second card's turn.
+    expect(calls).toHaveLength(1);
+    expect(getCard(db, 'entry2')?.lane).not.toBe('scrap');
+  });
+
+  it('a rate-limit park folds the usage the capped call was already billed for', async () => {
+    db = openDb();
+    // A provider cap is not a free call: the invocation can run for minutes
+    // and be billed before the cap is reported, and the park deliberately
+    // spends NO execution attempt — so without the fold that spend is
+    // invisible to every budget AND the card keeps re-dispatching. Same
+    // andon discriminator as the throw test above: 100 billed tokens against
+    // a 50-token run budget, with a second card that must never get its turn.
+    const { adapter, calls } = makeHarnessThrowingWithUsage(
+      { tokens: 100, cost: 0.1 },
+      { code: 'harness-rate-limited' },
+    );
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(dir, registry, { maxAttempts: 1, runMaxTokens: 50 });
+    seedCard(db, 'entry');
+    seedCard(db, 'entry2');
+    const { io, err } = makeIO();
+
+    // Virtual clock: a park sleeps toward its release gate, so a frozen clock
+    // would hang instead of letting the regression surface as an assertion.
+    await runVirtual(flow, registry, io);
+
+    const errText = err.join('\n');
+    expect(errText).toMatch(/andon/i);
+    expect(errText).toMatch(/token/i);
+    expect(calls).toHaveLength(1);
+    // The park's journal row keeps its outcome attribute intact, so
+    // countConsecutiveRateLimitParks still sees the streak it keys on.
+    const spans = harnessSpans(db);
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.attributes.outcome).toBe('harness-rate-limited');
+    expect(spans[0]!.usageUnknown).toBe(false);
+  });
+
+  it('regression: a thrown invocation with no usage attached still journals usageUnknown:true and folds nothing', async () => {
+    db = openDb();
+    // makeHarness's 'throw-nonzero' behavior attaches NO usage — the pre-#26
+    // shape, and still the correct one for a throw that genuinely cannot
+    // recover a figure (e.g. a claude wall-clock timeout).
+    const { adapter } = makeHarness({ behavior: 'throw-nonzero' });
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(dir, registry, { maxAttempts: 1 });
+    seedCard(db, 'entry');
+    const { io } = makeIO();
+
+    await run(flow, registry, io);
+
+    expect(getCard(db)?.lane).toBe('scrap');
+    const spans = harnessSpans(db);
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.usageUnknown).toBe(true);
+    expect(db.getStationUsage('entry', 'coder', 0)).toBeNull();
+    expect(db.getRunUsageTotals(DEFAULT_RUN_ID)).toEqual({ tokens: 0, costUsd: 0 });
   });
 });

@@ -268,15 +268,41 @@ describe('fan-out cache-warming stagger — release_at stamping (v10)', () => {
       ],
     };
     const { io } = makeIO();
+    // The gate has to be observed WHILE it is live: dispatching a card clears
+    // `release_at` (the gate it describes has just been passed), so by the time
+    // the run finishes there is no stamp left to assert on. The executor sleeps
+    // to the soonest gate, so the first sleep that finds children is the moment
+    // the stagger is in force.
+    let gated: Array<{ id: string; release_at: number | null }> = [];
+    const tick = advancingClock(1000);
+    const snapshotWhileGated = (): number => {
+      // Sampled every tick; kept the FIRST time a sibling is actually holding a
+      // gate, which is the only window in which the stamp exists.
+      if (gated.length === 0) {
+        const rows = db!
+          .getStateDb()
+          .prepare("SELECT id, release_at FROM cards WHERE parent_id = 'root' ORDER BY id")
+          .all() as Array<{ id: string; release_at: number | null }>;
+        if (rows.some((r) => r.release_at !== null)) gated = rows;
+      }
+      return tick();
+    };
     // Advancing clock + fast sleep so the stagger elapses and the run completes.
     await runExecutor({
       db,
       flow,
-      now: advancingClock(1000),
+      now: snapshotWhileGated,
       adapter: makeProposalAdapter(proposal),
       io,
       sleep: FAST_SLEEP,
     } as RunEngineArgs);
+
+    expect(gated.map((r) => r.id)).toEqual(['c1', 'c2', 'c3']);
+    // The first child (lowest id) is un-gated; it dispatches immediately to warm the cache.
+    expect(gated.find((r) => r.id === 'c1')!.release_at).toBeNull();
+    // Its siblings were held behind a future release gate.
+    expect(gated.find((r) => r.id === 'c2')!.release_at).not.toBeNull();
+    expect(gated.find((r) => r.id === 'c3')!.release_at).not.toBeNull();
 
     const rows = db
       .getStateDb()
@@ -284,13 +310,12 @@ describe('fan-out cache-warming stagger — release_at stamping (v10)', () => {
       .all() as Array<{ id: string; release_at: number | null; lane: string }>;
 
     expect(rows.map((r) => r.id)).toEqual(['c1', 'c2', 'c3']);
-    // The first child (lowest id) is un-gated; it dispatches immediately to warm the cache.
-    expect(rows.find((r) => r.id === 'c1')!.release_at).toBeNull();
-    // Its siblings were held behind a future release gate.
-    expect(rows.find((r) => r.id === 'c2')!.release_at).not.toBeNull();
-    expect(rows.find((r) => r.id === 'c3')!.release_at).not.toBeNull();
     // ...and the gate is genuinely NOT a deadlock: every child ran to terminal.
     for (const r of rows) expect(r.lane).toBe('done');
+    // A spent gate does not outlive its dispatch: the claim clears release_at,
+    // so no later reader of the column sees a stale past value (the ingress
+    // parked sweep reads MIN(release_at) to decide when a run is due).
+    for (const r of rows) expect(r.release_at).toBeNull();
   });
 
   it('does NOT stamp release_at when child_stagger_seconds is 0 (all children un-gated)', async () => {

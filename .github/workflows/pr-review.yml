@@ -1,154 +1,57 @@
-# Maintainer-only Nitpick PR review for Conduit.
+# Maintainer-only Nitpick PR review for Conduit — INTERNAL branches.
 #
 # The workflow definition is public, but the job runs only for branches in this
-# repository. Pull requests from forks never receive maintainer secrets, never
-# pull the private reviewer image, and continue to use the public test workflows.
+# repository. Pull requests from forks never receive maintainer secrets and
+# never pull the private reviewer image; they are handled by pr-review-fork.yml,
+# which is label-triggered, advisory, and checks out no fork code.
+#
+# The reviewer itself lives in nitpick-run.yml, called by both. Everything that
+# differs between internal and fork review is in these two caller files: the
+# trigger, the gate, the token scopes and the rate guards. A shared trigger is
+# the one thing that must NOT be factored out — `pull_request` and
+# `pull_request_target` are different security contexts.
 #
 # This repository is in a different owner (org) than queso/nitpick-flow, so it
-# cannot consume nitpick-flow's private reusable workflow. Instead we inline the
-# job here and pull the prebuilt per-flow image (Conduit engine + the nitpick flow
-# baked at /flow) directly from GHCR.
-#
-# This replaces the previous generic reviewer (queso/gh-workflows). Nitpick is now the reviewer.
+# cannot consume nitpick-flow's private reusable workflow. nitpick-run.yml pulls
+# the prebuilt per-flow image (Conduit engine + the nitpick flow baked at /flow)
+# directly from GHCR instead.
 #
 # Prerequisites (one-time, done outside this file):
-#   - repo secret FIREWORKS_AI_API_KEY — the OpenAI-compatible gateway key (Fireworks).
-#   - repo secret GHCR_READ_PAT       — a classic PAT with read:packages, able to pull the private
-#     ghcr.io/queso/nitpick-flow image cross-org. (GITHUB_TOKEN can't read another owner's package.)
-#
-# Model routing: Conduit talks to ONE OpenAI-compatible gateway (CONDUIT_BASE_URL +
-# CONDUIT_API_KEY). Both default models live on Fireworks; front them with a litellm proxy if you
-# ever split providers. Keep the image tag / model strings in sync with nitpick.yml upstream.
+#   - repo secret FIREWORKS_AI_API_KEY — the OpenAI-compatible gateway key.
+#   - repo secret GHCR_READ_PAT — a classic PAT with read:packages, able to pull
+#     the private ghcr.io/queso/nitpick-flow image cross-org. (GITHUB_TOKEN
+#     can't read another owner's package.)
 name: Nitpick PR Review
 
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize]
 
-env:
-  FLOW_IMAGE: ghcr.io/queso/nitpick-flow:main
-  REVIEWER_MODEL: accounts/fireworks/models/gpt-oss-120b
-  COORDINATOR_MODEL: accounts/fireworks/models/qwen3p7-plus
-  CONDUIT_BASE_URL: https://api.fireworks.ai/inference/v1
-
 jobs:
   nitpick:
     # This is the maintainer boundary. A contributor must have permission to
     # push a branch to this repository before Nitpick can use maintainer secrets
-    # on their pull request. Normal tests still run for fork PRs in test.yml.
+    # on their pull request. Normal tests still run for fork PRs in test.yml,
+    # and pr-review-fork.yml reviews them on request.
     if: >-
       github.event.pull_request.head.repo.fork == false &&
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
       packages: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fetch PR diff + context
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" \
-            -H "Accept: application/vnd.github.diff" > diff.patch
-          # Shared context: project conventions the reviewers respect.
-          { [ -f CLAUDE.md ] && cat CLAUDE.md; \
-            find . -maxdepth 3 -name AGENTS.md -exec sh -c 'echo "--- $1 ---"; cat "$1"' _ {} \; ; } \
-            > context.txt 2>/dev/null || true
-          node -e 'const fs=require("fs");fs.writeFileSync("context.json",JSON.stringify({context:fs.existsSync("context.txt")?fs.readFileSync("context.txt","utf8"):""}))'
-
-      - name: Log in to GHCR
-        # Cross-org private image: GITHUB_TOKEN can't see queso's package, so a read:packages PAT is
-        # required. If GHCR_READ_PAT is unset the pull falls back to anon and will fail on a private image.
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_READ_PAT || secrets.GITHUB_TOKEN }}
-
-      - name: Run Nitpick flow
-        env:
-          CONDUIT_API_KEY: ${{ secrets.FIREWORKS_AI_API_KEY }}
-        run: |
-          set -euo pipefail
-          # The per-flow image bakes flow.yaml/src/prompts at /flow (CONDUIT_PROJECT_ROOT=/flow).
-          # We need the PR diff IN and review.json OUT without shadowing that baked /flow, so we
-          # use the create → cp-in → start → cp-out → rm pattern (no project-root bind-mount).
-          # The diff goes in at /tmp, NOT /flow: `docker cp` creates container files owned by
-          # root, and `conduit run --input` re-writes the input as the entry artifact into the
-          # project root — overwriting a root-owned /flow/diff.patch as the non-root `conduit`
-          # user is an EACCES. Fed from /tmp, the engine creates /flow/diff.patch itself with
-          # the right ownership. (context.json and the rendered flow.yaml are only ever read,
-          # so root-owned 644 copies of those in /flow are fine.)
-          cid=$(docker create \
-            -v conduit_data:/data \
-            -e CONDUIT_API_KEY -e CONDUIT_BASE_URL \
-            "$FLOW_IMAGE" run /flow/flow.yaml --input /tmp/diff.patch)
-
-          # Conduit does NOT interpolate ${...} in flow.yaml — render the model names ourselves
-          # into the baked copy. (envsubst is restricted to our two vars so nothing else expands.)
-          docker cp "$cid:/flow/flow.yaml" flow.baked.yaml
-          envsubst '$REVIEWER_MODEL $COORDINATOR_MODEL' < flow.baked.yaml > flow.rendered.yaml
-          docker cp flow.rendered.yaml "$cid:/flow/flow.yaml"
-
-          # Inject runtime inputs: the diff to /tmp (the engine seeds it into /flow itself),
-          # context.json straight into the project root (read-only for the reviewers).
-          docker cp diff.patch  "$cid:/tmp/diff.patch"
-          docker cp context.json "$cid:/flow/context.json"
-
-          # Run to a terminal lane. A real failure (scrap/hold, doctor preflight) exits non-zero.
-          rc=0; docker start -a "$cid" || rc=$?
-          docker cp "$cid:/flow/review.json" review.json 2>/dev/null || true
-          docker rm "$cid" >/dev/null
-          if [ "$rc" -ne 0 ]; then echo "conduit run failed (exit $rc)"; exit "$rc"; fi
-          test -f review.json || { echo "no review.json produced"; exit 1; }
-
-      - name: Explain run failure
-        # Ported from nitpick-flow's nitpick.yml (keep in sync). `conduit run` is silent
-        # between doctor preflight and exit — on a scrap the log shows nothing but "exit 1"
-        # (observed during pre-public review). The journal on the conduit_data volume has the whole story;
-        # report-failure.mjs (baked in the image) prints per-card lane journeys, terminal
-        # reasons, gate verdicts, and the model-call span tail. Never fails the job:
-        # the exit code is captured explicitly (default shell has no pipefail, so a
-        # `docker | tee || true` pipeline would swallow docker's failure silently) and
-        # a reporting failure emits a visible ::warning:: annotation instead.
-        if: failure()
-        run: |
-          rc=0; out=$(docker run --rm -v conduit_data:/data \
-            --entrypoint bun "$FLOW_IMAGE" /flow/report-failure.mjs) || rc=$?
-          if [ "$rc" -eq 0 ]; then printf '%s\n' "$out" | tee -a "$GITHUB_STEP_SUMMARY"
-          else echo "::warning::Nitpick run post-mortem unavailable (docker exit $rc)"; fi
-
-      - name: Report model spend
-        # Ported from nitpick-flow's nitpick.yml (keep in sync). Best-effort per-run spend
-        # table (station × model, tokens, $) from the engine's journal, written to the job
-        # summary. $ is computed tokens × price table — Fireworks direct reports no per-call
-        # cost. Runs on failures too; that's when runaway spend happens. Exit code
-        # captured explicitly (no pipefail in the default shell) so a docker failure
-        # surfaces as a ::warning:: annotation instead of vanishing.
-        if: always()
-        run: |
-          rc=0; out=$(docker run --rm -v conduit_data:/data \
-            --entrypoint bun "$FLOW_IMAGE" /flow/report-cost.mjs) || rc=$?
-          if [ "$rc" -eq 0 ]; then printf '%s\n' "$out" | tee -a "$GITHUB_STEP_SUMMARY"
-          else echo "::warning::Nitpick spend report unavailable (docker exit $rc)"; fi
-
-      - name: Post review
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          # post-review.mjs is baked into the image (/flow/post-review.mjs); run it via the
-          # engine's Bun so the workflow needs no checkout of nitpick-flow's own source.
-          docker run --rm \
-            -e GITHUB_TOKEN -e GITHUB_REPOSITORY -e PR_NUMBER -e HEAD_SHA \
-            -e REVIEW_FILE=/review.json \
-            -v "$PWD/review.json":/review.json:ro \
-            --entrypoint bun \
-            "$FLOW_IMAGE" /flow/post-review.mjs
-        # A blocking verdict exits non-zero here; mark this job a required check to gate merge.
+    uses: ./.github/workflows/nitpick-run.yml
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+      # Empty: actions/checkout's default, the merge commit, which is what this
+      # workflow has always reviewed. Safe here because the head is a branch in
+      # this repository — see the gate above.
+      checkout_ref: ''
+      # BLOCKING. A blocking verdict fails the job; mark it a required check to
+      # gate merge. The fork caller sets advisory: true instead, and why is
+      # explained there.
+      advisory: false
+    secrets:
+      conduit_api_key: ${{ secrets.FIREWORKS_AI_API_KEY }}
+      ghcr_read_pat: ${{ secrets.GHCR_READ_PAT }}

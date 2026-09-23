@@ -30,6 +30,7 @@ import {
   type HarnessAdapter,
   type HarnessInvocation,
   type HarnessRegistry,
+  type UsageReport,
 } from '../worker/harness-adapter';
 
 const SECONDS = (n: number) => () => n;
@@ -60,6 +61,70 @@ function makeHarnessMaker(): { adapter: HarnessAdapter; calls: HarnessInvocation
       calls.push(call);
       writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'implemented' }), 'utf-8');
       return { outputs: [], usage: { tokens: 10, cost: 0.01 } };
+    },
+  };
+  return { adapter, calls };
+}
+
+// ---------------------------------------------------------------------------
+// issue #26 — a harness maker that reports NO usage, so a test isolating a
+// harness CRITIC's own spend does not have to net out the maker's.
+// ---------------------------------------------------------------------------
+
+function makeZeroUsageHarnessMaker(): { adapter: HarnessAdapter; calls: HarnessInvocation[] } {
+  const calls: HarnessInvocation[] = [];
+  const adapter: HarnessAdapter = {
+    name: 'fake-harness',
+    reportsUsage: true,
+    canRestrictTools: true,
+    async probeBinary() {
+      return { present: true };
+    },
+    async invoke(call: HarnessInvocation) {
+      calls.push(call);
+      writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'implemented' }), 'utf-8');
+      return { outputs: [], usage: { tokens: 0, cost: 0 } };
+    },
+  };
+  return { adapter, calls };
+}
+
+// ---------------------------------------------------------------------------
+// issue #26 — a configurable AGENTIC (harness) critic: fixed verdict, fixed or
+// caller-reported usage, and an optional adapter-configured default model (so
+// AC4's station-over-adapter precedence test can tell which one won). Each
+// reject carries a DISTINCT finding by default so guard #3 (no-progress) never
+// trips ahead of whatever guard a given test is isolating; pass `sameFindings`
+// to invert that when a test specifically wants guard #3.
+// ---------------------------------------------------------------------------
+
+function makeConfigurableHarnessCritic(
+  opts: {
+    verdict?: 'pass' | 'reject';
+    usage?: UsageReport;
+    name?: string;
+    adapterModel?: string;
+    sameFindings?: boolean;
+  } = {},
+): { adapter: HarnessAdapter; calls: HarnessInvocation[] } {
+  const verdict = opts.verdict ?? 'reject';
+  const usage: UsageReport = opts.usage ?? { tokens: 8, cost: 0.008 };
+  const calls: HarnessInvocation[] = [];
+  let n = 0;
+  const adapter: HarnessAdapter = {
+    name: opts.name ?? 'claude-critic',
+    reportsUsage: true,
+    canRestrictTools: true,
+    ...(opts.adapterModel !== undefined ? { model: opts.adapterModel } : {}),
+    async probeBinary() {
+      return { present: true };
+    },
+    async invoke(call: HarnessInvocation) {
+      calls.push(call);
+      n++;
+      const findings = verdict === 'reject' ? [opts.sameFindings === true ? 'same-finding' : `finding-${n}`] : [];
+      writeFileSync(join(process.cwd(), 'verdict.json'), JSON.stringify({ verdict, findings, return_to: 'coder' }), 'utf-8');
+      return { outputs: [], usage };
     },
   };
   return { adapter, calls };
@@ -104,9 +169,18 @@ function makeCritic(opts: { rejectsBeforePass?: number; sameFindings?: boolean }
 function writeGatedFlow(
   dir: string,
   registry: HarnessRegistry,
-  opts: { reworkCap?: number; harnessCritic?: string; criticTools?: string[] } = {},
+  opts: {
+    reworkCap?: number;
+    harnessCritic?: string;
+    criticTools?: string[];
+    /** issue #26 AC4: an explicit `check.critic.model` override for a harness critic. */
+    criticModel?: string;
+    /** issue #26 AC3: the run's token budget, so a test can size it below/above a critic's known spend. */
+    runMaxTokens?: number;
+  } = {},
 ): FlowConfig {
   const reworkCap = opts.reworkCap ?? 2;
+  const runMaxTokens = opts.runMaxTokens ?? 100000;
   mkdirSync(join(dir, 'prompts'), { recursive: true });
   writeFileSync(join(dir, 'prompts', 'coder.md'), 'TASK: {{task.json}}\n[[FB]]{{feedback}}[[/FB]]\nEND');
   writeFileSync(join(dir, 'prompts', 'verify.md'), 'Check {{result.json}}');
@@ -116,8 +190,9 @@ function writeGatedFlow(
   // A declared critic `tools` allowlist (WI-595) is threaded into the harness
   // critic's invocation (gate.ts) — only meaningful on the harness branch.
   const criticToolsPart = opts.criticTools !== undefined ? `tools: [${opts.criticTools.join(', ')}], ` : '';
+  const criticModelPart = opts.criticModel !== undefined ? `model: ${opts.criticModel}, ` : '';
   const criticBlock = opts.harnessCritic !== undefined
-    ? `critic: { role: critic, harness: ${opts.harnessCritic}, ${criticToolsPart}prompt_file: prompts/verify.md, prompt_version: "1" }`
+    ? `critic: { role: critic, harness: ${opts.harnessCritic}, ${criticModelPart}${criticToolsPart}prompt_file: prompts/verify.md, prompt_version: "1" }`
     : `critic: { role: critic, model: ${CRITIC_MODEL}, prompt_file: prompts/verify.md, prompt_version: "1" }`;
 
   const flowYaml = `
@@ -125,7 +200,7 @@ flow: harness-gate
 project_root: .
 flow_version: 1
 budgets:
-  run: { wall_clock_minutes: 10, max_tokens: 100000 }
+  run: { wall_clock_minutes: 10, max_tokens: ${runMaxTokens} }
   per_card: { max_execution_attempts: 4 }
   liveness: { no_progress_minutes: 3 }
 terminal_lanes: [done, scrap, hold]
@@ -192,8 +267,20 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function run(flow: FlowConfig, registry: HarnessRegistry, adapter: ModelAdapter): Promise<void> {
-  await runExecutor({ db: db!, flow, now: SECONDS(1000), adapter, io, harnessRegistry: registry } as RunEngineArgs);
+async function run(
+  flow: FlowConfig,
+  registry: HarnessRegistry,
+  adapter: ModelAdapter,
+  ioOverride: { out: (l: string) => void; err: (l: string) => void } = io,
+): Promise<void> {
+  await runExecutor({ db: db!, flow, now: SECONDS(1000), adapter, io: ioOverride, harnessRegistry: registry } as RunEngineArgs);
+}
+
+/** Captures stderr lines so a test can assert on (or rule out) the andon message. */
+function makeIO(): { io: { out: (l: string) => void; err: (l: string) => void }; out: string[]; err: string[] } {
+  const out: string[] = [];
+  const err: string[] = [];
+  return { io: { out: (l) => out.push(l), err: (l) => err.push(l) }, out, err };
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +530,9 @@ function writeNonHarnessMakerGatedFlow(
   dir: string,
   registry: HarnessRegistry,
   makerKind: 'transform' | 'deterministic',
+  opts: { runMaxTokens?: number } = {},
 ): FlowConfig {
+  const runMaxTokens = opts.runMaxTokens ?? 100000;
   mkdirSync(join(dir, 'prompts'), { recursive: true });
   writeFileSync(join(dir, 'prompts', 'coder.md'), 'TASK: {{task.json}}');
   // The deterministic maker (`command: "true"`) writes no artifact, so its
@@ -473,7 +562,7 @@ flow: harness-critic-${makerKind}-maker
 project_root: .
 flow_version: 1
 budgets:
-  run: { wall_clock_minutes: 10, max_tokens: 100000 }
+  run: { wall_clock_minutes: 10, max_tokens: ${runMaxTokens} }
   per_card: { max_execution_attempts: 4 }
   liveness: { no_progress_minutes: 3 }
 terminal_lanes: [done, scrap, hold]
@@ -557,5 +646,240 @@ describe('review #1 — an agentic (harness) critic gates a NON-harness maker', 
     expect(critic.calls.length).toBeGreaterThanOrEqual(1);
     expect(gateVerdicts(db).some((v) => v.verdict === 'pass')).toBe(true);
     expect(getCard(db)?.lane).toBe('done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// issue #26 — a harness gate critic's usage/cost/model was discarded: hardcoded
+// to { tokens: 0, cost: 0 } on both verdict branches, and never threaded a
+// `check.critic.model` override into the invocation. AC3 makes the critic's
+// billed spend reach the SAME run/wave accumulators the maker path feeds; AC4
+// makes `check.critic.model` reach `HarnessInvocation.model` with
+// station-over-adapter precedence (FR-10).
+// ---------------------------------------------------------------------------
+
+/** A ModelAdapter that must never be touched — the gate critic here is a harness. */
+const neverModel: ModelAdapter = {
+  async call() {
+    throw new Error('gate critic must be the harness, not the model');
+  },
+};
+
+describe('issue #26 AC3 — a harness gate critic\'s own spend reaches the run budget', () => {
+  it('folds a rejecting critic\'s real usage into tokensSpent, tripping the andon on a tight budget', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    // A critic that keeps rejecting (distinct findings each time, so guard #3
+    // never trips first) and reports 5000 tokens per call — large next to a
+    // tight run budget.
+    const critic = makeConfigurableHarnessCritic({ verdict: 'reject', usage: { tokens: 5000, cost: 5 } });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    // Budget of 100 tokens: the maker itself spends 0, so ONLY the critic's
+    // fold can cross it. A generous rework cap so the run would otherwise keep
+    // reworking rather than scrapping — isolating the andon as the halt cause.
+    const flow = writeGatedFlow(dir, registry, {
+      harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'], reworkCap: 10, runMaxTokens: 100,
+    });
+    seedCard(db);
+    const { io: capturedIo, err } = makeIO();
+
+    await run(flow, registry, neverModel, capturedIo);
+
+    // Halted mid-flight: neither done (the gate never passed) nor scrap (the
+    // rework cap was never reached) — the andon stopped it first.
+    expect(getCard(db)?.lane).toBe('coder');
+    expect(getCard(db)?.status).not.toBe('scrapped');
+    const errText = err.join('\n');
+    expect(errText).toMatch(/andon/i);
+    expect(errText).toMatch(/token/i);
+  });
+
+  it('does NOT halt the same flow when the budget is generous — it runs to a rework-cap scrap instead', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'reject', usage: { tokens: 5000, cost: 5 } });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    // Same critic and same per-call spend as the halting test above; only the
+    // budget changes — generous enough that several rejections fit inside it,
+    // so the run reaches the rework-cap scrap rather than the andon.
+    const flow = writeGatedFlow(dir, registry, {
+      harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'], reworkCap: 1, runMaxTokens: 1_000_000,
+    });
+    seedCard(db);
+    const { io: capturedIo, err } = makeIO();
+
+    await run(flow, registry, neverModel, capturedIo);
+
+    expect(getCard(db)?.lane).toBe('scrap');
+    expect(terminalReasons(db)).toContain('rework_cap');
+    expect(err.join('\n')).not.toMatch(/andon/i);
+  });
+
+  it('journals a <station>.harness-critic span with the critic\'s real tokens, cost, and adapter name', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    // rework_cap: 0 — the FIRST rejection is already at cap, so exactly one
+    // critic call happens (a clean, single-span assertion).
+    const critic = makeConfigurableHarnessCritic({ verdict: 'reject', usage: { tokens: 42, cost: 0.42 }, name: 'claude-critic' });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'], reworkCap: 0 });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(1);
+    const spans = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry');
+    const criticSpans = spans.filter((s) => s.name === 'coder.harness-critic');
+    expect(criticSpans).toHaveLength(1);
+    expect(criticSpans[0]!.adapter).toBe('claude-critic');
+    expect(criticSpans[0]!.usageUnknown).toBe(false);
+
+    const usage = db.getStationUsage('entry', 'coder', 0);
+    expect(usage).not.toBeNull();
+    const u = usage as Record<string, number | string>;
+    expect(Number(u['gen_ai.usage.input_tokens']) + Number(u['gen_ai.usage.output_tokens'])).toBe(42);
+    expect(u['cost_usd']).toBe(0.42);
+  });
+
+  it('an unknown-usage critic journals usageUnknown:true and folds NOTHING into the budget', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'reject', usage: { unknown: true } });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    // A budget that WOULD be tripped by nearly any nonzero folded figure, so a
+    // silent halt here would prove the unknown usage got folded as "some number".
+    const flow = writeGatedFlow(dir, registry, {
+      harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'], reworkCap: 0, runMaxTokens: 10,
+    });
+    seedCard(db);
+    const { io: capturedIo, err } = makeIO();
+
+    await run(flow, registry, neverModel, capturedIo);
+
+    // Scrapped via rework_cap (the guard, not the andon) proves nothing folded.
+    expect(getCard(db)?.lane).toBe('scrap');
+    expect(terminalReasons(db)).toContain('rework_cap');
+    expect(err.join('\n')).not.toMatch(/andon/i);
+
+    const spans = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry');
+    const criticSpans = spans.filter((s) => s.name === 'coder.harness-critic');
+    expect(criticSpans).toHaveLength(1);
+    expect(criticSpans[0]!.usageUnknown).toBe(true);
+  });
+
+  it('a gated kind:deterministic maker\'s harness critic usage reaches the run budget (halts on a tight budget)', async () => {
+    db = openDb();
+    // Reuses the review #1 fixture: a `kind: deterministic` maker (`command:
+    // "true"`, bills nothing itself) gated by a harness critic. A PASS
+    // verdict still runs the fold+andon check inside runGateCheckOrAdvance
+    // (that check is unconditional on verdict) — 5000 tokens against a
+    // 100-token budget, so a halt here can ONLY be explained by the critic's
+    // usage reaching tokensSpent via foldHarnessUsage: the deterministic
+    // command touches neither a ModelAdapter nor a harness, so nothing else
+    // in this path could move the budget. Mirrors the AC3 headline test's
+    // halt/no-halt discriminator, applied to the deterministic maker kind
+    // specifically (the one path that would NOT notice a broken fold, since
+    // it has no adapter call of its own to leak the failure some other way).
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass', usage: { tokens: 5000, cost: 5 }, name: 'claude-critic' });
+    const registry = createHarnessRegistry([critic.adapter]);
+    const flow = writeNonHarnessMakerGatedFlow(dir, registry, 'deterministic', { runMaxTokens: 100 });
+    seedCard(db);
+    const { io: capturedIo, err } = makeIO();
+
+    await run(flow, registry, neverModel, capturedIo);
+
+    // Halted before advancing: the andon trips on the critic's own folded
+    // spend, so the card never reaches 'done' despite the pass verdict.
+    expect(getCard(db)?.lane).not.toBe('done');
+    const errText = err.join('\n');
+    expect(errText).toMatch(/andon/i);
+    expect(errText).toMatch(/token/i);
+  });
+
+  it('...does NOT halt the same deterministic-maker flow when the budget is generous (negative control)', async () => {
+    db = openDb();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass', usage: { tokens: 5000, cost: 5 }, name: 'claude-critic' });
+    const registry = createHarnessRegistry([critic.adapter]);
+    const flow = writeNonHarnessMakerGatedFlow(dir, registry, 'deterministic', { runMaxTokens: 100000 });
+    seedCard(db);
+    const { io: capturedIo, err } = makeIO();
+
+    await run(flow, registry, neverModel, capturedIo);
+
+    expect(getCard(db)?.lane).toBe('done');
+    expect(err.join('\n')).not.toMatch(/andon/i);
+  });
+
+  it('journals the harness critic\'s usage on the deterministic maker path (journal only — the fold is proven separately above)', async () => {
+    db = openDb();
+    const critic = makeHarnessCritic('pass', []); // usage: { tokens: 8, cost: 0.008 }
+    const registry = createHarnessRegistry([critic.adapter]);
+    const flow = writeNonHarnessMakerGatedFlow(dir, registry, 'deterministic');
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(getCard(db)?.lane).toBe('done');
+    const usage = db.getStationUsage('entry', 'coder', 0);
+    expect(usage).not.toBeNull();
+    const u = usage as Record<string, number | string>;
+    expect(Number(u['gen_ai.usage.input_tokens']) + Number(u['gen_ai.usage.output_tokens'])).toBe(8);
+    expect(u['cost_usd']).toBe(0.008);
+  });
+
+  it('journals the critic under a name distinct from the maker\'s <station>.harness span — never the same name', async () => {
+    db = openDb();
+    const maker = makeHarnessMaker(); // writes 'coder.harness' spans, usage {tokens:10, cost:0.01}
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass' });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(getCard(db)?.lane).toBe('done');
+    const spans = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry');
+    const makerSpans = spans.filter((s) => s.name === 'coder.harness');
+    const criticSpans = spans.filter((s) => s.name === 'coder.harness-critic');
+    // The maker's own span keeps its ORIGINAL name — proves the critic wiring
+    // didn't rename or absorb it.
+    expect(makerSpans.length).toBeGreaterThanOrEqual(1);
+    expect(criticSpans.length).toBeGreaterThanOrEqual(1);
+    // Nothing the critic wrote collides with the exact name
+    // countConsecutiveRateLimitParks keys its streak on.
+    expect(spans.every((s) => s.name !== 'coder.harness' || makerSpans.includes(s))).toBe(true);
+  });
+});
+
+describe('issue #26 AC4 — check.critic.model reaches the harness critic\'s HarnessInvocation.model (FR-10)', () => {
+  it('threads an explicit check.critic.model into the invocation, winning over the adapter\'s own default', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass', adapterModel: 'adapter-default-model' });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    const flow = writeGatedFlow(dir, registry, {
+      harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'], criticModel: 'station-critic-model',
+    });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(1);
+    expect(critic.calls[0]!.model).toBe('station-critic-model');
+  });
+
+  it('falls back to the adapter\'s own configured default when check.critic.model is absent', async () => {
+    db = openDb();
+    const maker = makeZeroUsageHarnessMaker();
+    const critic = makeConfigurableHarnessCritic({ verdict: 'pass', adapterModel: 'adapter-default-model' });
+    const registry = createHarnessRegistry([maker.adapter, critic.adapter]);
+    // No criticModel declared at all.
+    const flow = writeGatedFlow(dir, registry, { harnessCritic: 'claude-critic', criticTools: ['Read', 'Write'] });
+    seedCard(db);
+
+    await run(flow, registry, neverModel);
+
+    expect(critic.calls).toHaveLength(1);
+    expect(critic.calls[0]!.model).toBe('adapter-default-model');
   });
 });

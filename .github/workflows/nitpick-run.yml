@@ -1,0 +1,281 @@
+# Nitpick reviewer — the shared half. Not triggerable on its own.
+#
+# Two callers, with deliberately different security contexts:
+#
+#   pr-review.yml       `pull_request`, internal branches, automatic, BLOCKING.
+#   pr-review-fork.yml  `pull_request_target`, fork PRs, label-triggered,
+#                       ADVISORY, and it never checks out fork code.
+#
+# Everything that differs between those two lives in the CALLER: the trigger,
+# the gate, the token scopes, the rate guards, and who may ask for a review.
+# What lives here is the part that would otherwise be copy-pasted — the model
+# names, the image, and the docker create → cp-in → start → cp-out → rm dance.
+#
+# WHY THAT SPLIT. A reusable workflow cannot widen its caller's permissions, so
+# it is safe to share. What is NOT safe to share is a trigger: `pull_request`
+# and `pull_request_target` are different security contexts, and a single file
+# holding both would be one file where half the jobs may see fork code and half
+# must never. Keeping the triggers in separate callers is what makes the
+# dangerous one auditable on its own.
+#
+# NOTHING HERE MAY READ `github.event`. In a called workflow that is the
+# CALLER's event, so its shape depends on which trigger fired. Every
+# PR-specific value arrives as an explicit input, and `checkout_ref` is how the
+# fork caller pins the checkout to base.
+name: Nitpick (shared)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: The pull request to review.
+        required: true
+        type: number
+      head_sha:
+        description: Commit the review is posted against.
+        required: true
+        type: string
+      checkout_ref:
+        description: >-
+          Ref to check out for project context (CLAUDE.md / AGENTS.md). Empty
+          means actions/checkout's default, which on `pull_request` is the merge
+          commit. The FORK caller passes base.sha: taking context from the fork
+          would let a contributor rewrite the conventions the reviewer is told
+          to respect, inside the pull request being reviewed.
+        required: false
+        default: ''
+        type: string
+      advisory:
+        description: >-
+          When true a blocking verdict does not fail the job. The fork caller
+          sets this because the reviewed text is written by the person being
+          reviewed, so neither verdict is trustworthy enough to gate a merge.
+        required: false
+        default: false
+        type: boolean
+      max_diff_bytes:
+        description: Skip review past this diff size. 0 disables the cap.
+        required: false
+        default: 0
+        type: number
+    outputs:
+      too_large:
+        description: 'true when the diff exceeded max_diff_bytes and nothing ran.'
+        value: ${{ jobs.nitpick.outputs.too_large }}
+    secrets:
+      conduit_api_key:
+        description: OpenAI-compatible gateway key (Fireworks).
+        required: true
+      ghcr_read_pat:
+        description: >-
+          Classic PAT with read:packages, for the cross-org private image.
+          GITHUB_TOKEN cannot read another owner's package.
+        required: false
+
+env:
+  FLOW_IMAGE: ghcr.io/queso/nitpick-flow:main
+  # Both seats on glm-5p3-flash (nitpick-flow docs/model-refresh-2026-09.md):
+  # gpt-oss-120b had ~zero recall at production prompt size (~23k tokens),
+  # and qwen3p7-plus is being sunset. Keep in sync with nitpick-flow's own
+  # nitpick.yml defaults.
+  REVIEWER_MODEL: accounts/fireworks/models/glm-5p3-flash
+  COORDINATOR_MODEL: accounts/fireworks/models/glm-5p3-flash
+  CONDUIT_BASE_URL: https://api.fireworks.ai/inference/v1
+
+jobs:
+  nitpick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      too_large: ${{ steps.inputs.outputs.too_large }}
+    steps:
+      # ── Preflight ─────────────────────────────────────────────────────────
+      # This reviewer needs two credentials that are listed as one-time
+      # prerequisites in pr-review.yml's header and, at the time of writing,
+      # had never been created. The result was `Error response from daemon:
+      # denied` on the image pull and a RED `nitpick` check on every pull
+      # request going back months — a check nobody could act on, which is how a
+      # check stops being read at all.
+      #
+      # A missing credential is a configuration state, not a review failure, so
+      # it reports as one: the job skips and goes green with a WARNING
+      # annotation on every run. It is deliberately not `continue-on-error`,
+      # which would also swallow a genuine reviewer failure, and deliberately
+      # not silent, because a reviewer that quietly stops reviewing is worse
+      # than one that is visibly off.
+      #
+      # This needs no reverting. The moment both secrets exist the check runs
+      # for real.
+      - name: Preflight — reviewer credentials
+        id: preflight
+        env:
+          # Comparing a secret to '' does not expose it.
+          HAS_KEY: ${{ secrets.conduit_api_key != '' }}
+          HAS_PAT: ${{ secrets.ghcr_read_pat != '' }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ "$HAS_KEY" = "true" ] || missing="$missing FIREWORKS_AI_API_KEY"
+          [ "$HAS_PAT" = "true" ] || missing="$missing GHCR_READ_PAT"
+          if [ -n "$missing" ]; then
+            echo "::warning title=Nitpick not configured::Skipping review. Missing repository secret(s):$missing. The reviewer cannot pull its image or reach the gateway without them."
+            echo "configured=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      # persist-credentials: false — nothing after this step uses git, and a
+      # token left in .git/config is one the container steps could read.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.preflight.outputs.configured == 'true'
+        with:
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      # Every later step already gates on steps.inputs.outputs.ok, which this
+      # step is the only writer of — so gating here gates the whole job.
+      - name: Fetch PR diff + context
+        id: inputs
+        if: steps.preflight.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Via env, never inline in the script.
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}
+        run: |
+          set -euo pipefail
+          # GitHub refuses the diff media type with 406 once a pull request
+          # passes 300 changed files or 20,000 diff lines. Nothing was
+          # reviewable, which is the same outcome as the byte cap below, so it
+          # is reported the same way. Letting `set -e` kill the step instead
+          # would turn this check red on exactly the largest pull requests —
+          # the ones the cap exists for — and the caller would never reach its
+          # "diff too large" comment. The fork caller's `advisory` flag is no
+          # help here either: `continue-on-error` sits on `Post review` only.
+          if ! gh api "repos/$REPO/pulls/$PR_NUMBER" \
+               -H "Accept: application/vnd.github.diff" > diff.patch 2>api.err; then
+            if grep -q 'HTTP 406' api.err; then
+              echo "GitHub refused the diff as too large: $(tr '\n' ' ' < api.err)"
+              echo "too_large=true" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat api.err >&2
+            exit 1
+          fi
+
+          size=$(wc -c < diff.patch)
+          if [ "$MAX_DIFF_BYTES" -gt 0 ] && [ "$size" -gt "$MAX_DIFF_BYTES" ]; then
+            echo "diff is $size bytes, over the $MAX_DIFF_BYTES cap — not reviewing"
+            echo "too_large=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Shared context: project conventions the reviewers respect, from the
+          # ref checked out above.
+          { [ -f CLAUDE.md ] && cat CLAUDE.md; \
+            find . -maxdepth 3 -name AGENTS.md -exec sh -c 'echo "--- $1 ---"; cat "$1"' _ {} \; ; } \
+            > context.txt 2>/dev/null || true
+          node -e 'const fs=require("fs");fs.writeFileSync("context.json",JSON.stringify({context:fs.existsSync("context.txt")?fs.readFileSync("context.txt","utf8"):""}))'
+          echo "ok=true" >>"$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: steps.inputs.outputs.ok == 'true'
+        # Cross-org private image: GITHUB_TOKEN can't see queso's package, so a
+        # read:packages PAT is required. repository_owner rather than
+        # github.actor — under pull_request_target the actor is the fork's
+        # author, who has no standing at this registry.
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.ghcr_read_pat || secrets.GITHUB_TOKEN }}
+
+      - name: Run Nitpick flow
+        if: steps.inputs.outputs.ok == 'true'
+        env:
+          CONDUIT_API_KEY: ${{ secrets.conduit_api_key }}
+        run: |
+          set -euo pipefail
+          # The per-flow image bakes flow.yaml/src/prompts at /flow
+          # (CONDUIT_PROJECT_ROOT=/flow). We need the PR diff IN and review.json
+          # OUT without shadowing that baked /flow, so we use the create →
+          # cp-in → start → cp-out → rm pattern (no project-root bind-mount).
+          # The diff goes in at /tmp, NOT /flow: `docker cp` creates container
+          # files owned by root, and `conduit run --input` re-writes the input
+          # as the entry artifact into the project root — overwriting a
+          # root-owned /flow/diff.patch as the non-root `conduit` user is an
+          # EACCES. Fed from /tmp, the engine creates /flow/diff.patch itself
+          # with the right ownership. (context.json and the rendered flow.yaml
+          # are only ever read, so root-owned 644 copies in /flow are fine.)
+          cid=$(docker create \
+            -v conduit_data:/data \
+            -e CONDUIT_API_KEY -e CONDUIT_BASE_URL \
+            "$FLOW_IMAGE" run /flow/flow.yaml --input /tmp/diff.patch)
+
+          # Conduit does NOT interpolate ${...} in flow.yaml — render the model
+          # names ourselves into the baked copy. (envsubst is restricted to our
+          # two vars so nothing else expands.)
+          docker cp "$cid:/flow/flow.yaml" flow.baked.yaml
+          envsubst '$REVIEWER_MODEL $COORDINATOR_MODEL' < flow.baked.yaml > flow.rendered.yaml
+          docker cp flow.rendered.yaml "$cid:/flow/flow.yaml"
+
+          docker cp diff.patch   "$cid:/tmp/diff.patch"
+          docker cp context.json "$cid:/flow/context.json"
+
+          rc=0; docker start -a "$cid" || rc=$?
+          docker cp "$cid:/flow/review.json" review.json 2>/dev/null || true
+          docker rm "$cid" >/dev/null
+          if [ "$rc" -ne 0 ]; then echo "conduit run failed (exit $rc)"; exit "$rc"; fi
+          test -f review.json || { echo "no review.json produced"; exit 1; }
+
+      - name: Explain run failure
+        # Ported from nitpick-flow's nitpick.yml (keep in sync). `conduit run`
+        # is silent between doctor preflight and exit — on a scrap the log shows
+        # nothing but "exit 1". The journal on the conduit_data volume has the
+        # whole story; report-failure.mjs (baked in the image) prints per-card
+        # lane journeys, terminal reasons, gate verdicts and the model-call span
+        # tail. Never fails the job: the exit code is captured explicitly (the
+        # default shell has no pipefail, so `docker | tee || true` would swallow
+        # docker's failure) and a reporting failure emits a ::warning:: instead.
+        if: failure() && steps.inputs.outputs.ok == 'true'
+        run: |
+          rc=0; out=$(docker run --rm -v conduit_data:/data \
+            --entrypoint bun "$FLOW_IMAGE" /flow/report-failure.mjs) || rc=$?
+          if [ "$rc" -eq 0 ]; then printf '%s\n' "$out" | tee -a "$GITHUB_STEP_SUMMARY"
+          else echo "::warning::Nitpick run post-mortem unavailable (docker exit $rc)"; fi
+
+      - name: Report model spend
+        # Best-effort per-run spend table (station × model, tokens, $) from the
+        # engine's journal. $ is tokens × price table — Fireworks direct reports
+        # no per-call cost. Runs on failures too; that is when runaway spend
+        # happens, and on the fork caller the spender is a stranger.
+        if: always() && steps.inputs.outputs.ok == 'true'
+        run: |
+          rc=0; out=$(docker run --rm -v conduit_data:/data \
+            --entrypoint bun "$FLOW_IMAGE" /flow/report-cost.mjs) || rc=$?
+          if [ "$rc" -eq 0 ]; then printf '%s\n' "$out" | tee -a "$GITHUB_STEP_SUMMARY"
+          else echo "::warning::Nitpick spend report unavailable (docker exit $rc)"; fi
+
+      - name: Post review
+        if: steps.inputs.outputs.ok == 'true'
+        # A blocking verdict exits non-zero. The internal caller lets that fail
+        # the job (mark it a required check to gate merge); the fork caller
+        # passes advisory: true so it cannot.
+        continue-on-error: ${{ inputs.advisory }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # post-review.mjs is baked into the image (/flow/post-review.mjs); run
+          # it via the engine's Bun so the workflow needs no checkout of
+          # nitpick-flow's own source.
+          docker run --rm \
+            -e GITHUB_TOKEN -e GITHUB_REPOSITORY -e PR_NUMBER -e HEAD_SHA \
+            -e REVIEW_FILE=/review.json \
+            -v "$PWD/review.json":/review.json:ro \
+            --entrypoint bun \
+            "$FLOW_IMAGE" /flow/post-review.mjs

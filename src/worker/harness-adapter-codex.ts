@@ -39,7 +39,7 @@
  * Do NOT touch ./harness.ts (unrelated worker-pool subprocess harness).
  */
 
-import type { HarnessAdapter, HarnessInvocation, HarnessResult, BinaryProbe } from './harness-adapter';
+import type { HarnessAdapter, HarnessInvocation, HarnessResult, BinaryProbe, KnownUsage } from './harness-adapter';
 import { runHarnessProcess } from './harness-runner';
 import type { HarnessCommand, HarnessRunnerConfig, HarnessSpawnResult } from './harness-runner';
 
@@ -147,10 +147,16 @@ export function planCodexSandbox(tools: readonly string[]): SandboxPlan | null {
  * Throws a NAMED error — never resolve to a silent zero-usage success.
  * An optional `code` tags the two spawn-failure classes (timeout, non-zero
  * exit) so the executor can classify the throw (WI-566), mirroring the
- * claude-headless `fail()` precedent.
+ * claude-headless `fail()` precedent. `detail` mirrors claude's mechanism for
+ * attaching extra fields to the thrown error (issue #26 AC5: a recovered
+ * `usage` figure rides through here).
  */
-function fail(reason: string, code?: string): never {
-  throw Object.assign(new Error(`codex-exec: ${reason}`), code !== undefined ? { code } : {});
+function fail(reason: string, code?: string, detail?: Record<string, unknown>): never {
+  throw Object.assign(
+    new Error(`codex-exec: ${reason}`),
+    code !== undefined ? { code } : {},
+    detail ?? {},
+  );
 }
 
 async function defaultProbe(command: string): Promise<BinaryProbe> {
@@ -203,6 +209,44 @@ function accumulateUsage(stdout: string): AccumulatedUsage | null {
     }
   }
   return seen ? total : null;
+}
+
+/**
+ * Build the structured `KnownUsage` object from accumulated per-turn usage.
+ * ONE construction, shared by the success path and by the two throw sites
+ * that can recover a genuine figure (`harness-timeout`, `harness-nonzero-exit`)
+ * — issue #26 AC5 — so the shape can never drift between "this call succeeded"
+ * and "this call failed but was billed".
+ */
+function knownUsageFrom(usage: AccumulatedUsage): KnownUsage {
+  // Token counts ARE genuinely available and useful for budget/andon
+  // accounting even without a cost figure — extract them unconditionally
+  // rather than discarding known tokens alongside an absent cost. Codex
+  // charges for reasoning_output_tokens, so they are part of the output
+  // total; counts are the sum across every per-turn turn.completed event.
+  const tokens = usage.inputTokens + usage.outputTokens + usage.reasoningTokens;
+  // Codex's real usage schema carries no cost field — cost stays a
+  // best-effort 0 (documented as "unavailable", not a real signal); any
+  // total_cost_usd a future build emits is summed by accumulateUsage.
+  const cost = usage.cost;
+
+  return {
+    tokens,
+    cost,
+    // Issue #5. input_tokens is INCLUSIVE of cached_input_tokens here, so
+    // uncached input is the difference — clamped at 0 because the two
+    // counters are summed independently across turns and a malformed
+    // event could otherwise drive it negative. Reasoning tokens are billed
+    // as output, which is where the total already counts them.
+    breakdown: {
+      inputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens),
+      outputTokens: usage.outputTokens + usage.reasoningTokens,
+      cacheReadInputTokens: usage.cachedInputTokens,
+      // Codex reports no cache-CREATION counter, only reads. Zero here is
+      // "the provider does not report it", not "no cache was written".
+      cacheCreationInputTokens: 0,
+    },
+  };
 }
 
 export function createCodexHarnessAdapter(config: CodexHarnessAdapterConfig): HarnessAdapter {
@@ -278,58 +322,50 @@ export function createCodexHarnessAdapter(config: CodexHarnessAdapterConfig): Ha
         },
       );
 
+      // PARSE BEFORE THE TIMEOUT AND EXIT-CODE BAILS (issue #26 AC5) — this
+      // ordering is load-bearing, mirroring the precedent in the claude
+      // adapter where parseClaudeStream deliberately runs before the
+      // exit-code bail (issue #3). Codex's usage lives in PER-TURN
+      // `turn.completed` events streamed as the run proceeds, not in a single
+      // terminal event, so a run killed at the wall-clock bound or a crash
+      // after several completed turns still has real per-turn usage sitting
+      // in the captured stdout. Reading it here, before either bail, means a
+      // timeout or a non-zero exit can still carry the tokens the provider
+      // already billed — unlike claude, codex CAN recover usage from a kill.
+      const usage = accumulateUsage(spawnResult.stdout);
+      const billedUsage = usage !== null ? knownUsageFrom(usage) : undefined;
+
       if (spawnResult.timedOut) {
-        fail('invocation exceeded its timeout and was killed', 'harness-timeout');
+        fail(
+          'invocation exceeded its timeout and was killed',
+          'harness-timeout',
+          billedUsage !== undefined ? { usage: billedUsage } : undefined,
+        );
       }
       if (spawnResult.exitCode !== 0) {
-        fail(`exited with code ${spawnResult.exitCode}: ${spawnResult.stderr.slice(0, 500)}`, 'harness-nonzero-exit');
+        fail(
+          `exited with code ${spawnResult.exitCode}: ${spawnResult.stderr.slice(0, 500)}`,
+          'harness-nonzero-exit',
+          billedUsage !== undefined ? { usage: billedUsage } : undefined,
+        );
       }
-
-      const usage = accumulateUsage(spawnResult.stdout);
 
       // PRD NFR-2: a successful run whose stream carries NO parseable usage
       // event AT ALL is journaled EXPLICITLY unknown — never a fabricated
       // { tokens: 0, cost: 0 }. This is distinct from a usage event that IS
-      // present but lacks a cost figure (handled below): codex's real
-      // turn.completed schema never includes total_cost_usd (verified against
-      // the official Codex manual — input_tokens/cached_input_tokens/
-      // output_tokens/reasoning_output_tokens only), so gating this branch on
-      // cost's presence would fire on every real invocation and defeat AC3
-      // (parsing real usage) entirely.
-      if (usage === null) {
+      // present but lacks a cost figure (handled inside knownUsageFrom):
+      // codex's real turn.completed schema never includes total_cost_usd
+      // (verified against the official Codex manual — input_tokens/
+      // cached_input_tokens/output_tokens/reasoning_output_tokens only), so
+      // gating this branch on cost's presence would fire on every real
+      // invocation and defeat AC3 (parsing real usage) entirely.
+      if (billedUsage === undefined) {
         return { outputs: [], usage: { unknown: true } };
       }
 
-      // Token counts ARE genuinely available and useful for budget/andon
-      // accounting even without a cost figure — extract them unconditionally
-      // rather than discarding known tokens alongside an absent cost. Codex
-      // charges for reasoning_output_tokens, so they are part of the output
-      // total; counts are the sum across every per-turn turn.completed event.
-      const tokens = usage.inputTokens + usage.outputTokens + usage.reasoningTokens;
-      // Codex's real usage schema carries no cost field — cost stays a
-      // best-effort 0 (documented as "unavailable", not a real signal); any
-      // total_cost_usd a future build emits is summed by accumulateUsage.
-      const cost = usage.cost;
-
       return {
         outputs: [],
-        usage: {
-          tokens,
-          cost,
-          // Issue #5. input_tokens is INCLUSIVE of cached_input_tokens here, so
-          // uncached input is the difference — clamped at 0 because the two
-          // counters are summed independently across turns and a malformed
-          // event could otherwise drive it negative. Reasoning tokens are billed
-          // as output, which is where the total already counts them.
-          breakdown: {
-            inputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens),
-            outputTokens: usage.outputTokens + usage.reasoningTokens,
-            cacheReadInputTokens: usage.cachedInputTokens,
-            // Codex reports no cache-CREATION counter, only reads. Zero here is
-            // "the provider does not report it", not "no cache was written".
-            cacheCreationInputTokens: 0,
-          },
-        },
+        usage: billedUsage,
       };
     },
   };

@@ -125,6 +125,7 @@ function recordingRespawn(resultFor: (eventId: string) => RedriveResult): Respaw
 }
 
 const allSpawn = (): RedriveResult => 'spawned';
+/** Every re-drive fails transiently — the attempt-capped path. */
 const allTransient = (): RedriveResult => 'transient_failure';
 
 // ===========================================================================
@@ -321,6 +322,32 @@ describe('startPeriodicRedrive (the original ingress-attribution work, FR-3)', (
 
     expect(respawn.calls).toEqual(['e-periodic']);
     expect(db.getIngressEvent('e-periodic')!.spawn_state).toBe('spawned');
+    handle.stop();
+  });
+
+  it('a throwing afterSweep does not stop the next tick from sweeping (issue #7)', async () => {
+    // afterSweep is the parked-run resume; a persistence error there must not
+    // become an unhandled rejection that leaves the sweep loop wedged.
+    seedFailed('e-after', 1);
+    const respawn = recordingRespawn(allSpawn);
+    const clock = manualSchedule();
+    let afterSweeps = 0;
+
+    const handle = startPeriodicRedrive({
+      db, respawn: respawn.seam, cap: CAP, intervalMs: 60_000, schedule: clock.schedule,
+      afterSweep: async () => { afterSweeps++; throw new Error('state db unavailable'); },
+    });
+
+    clock.fire();
+    await settle();
+    expect(afterSweeps).toBe(1);
+
+    seedFailed('e-next', 1);
+    clock.fire();
+    await settle();
+
+    expect(afterSweeps).toBe(2);
+    expect(respawn.calls).toEqual(['e-after', 'e-next']);
     handle.stop();
   });
 
@@ -1010,5 +1037,141 @@ describe('re-drive failure alerting (#8)', () => {
     expect(db.getIngressEvent('e-exit-hang')!.spawn_state).toBe('failed');
     expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'spawn_failed']);
     expect(slots.inFlightCount()).toBe(0);
+  });
+});
+
+// ===========================================================================
+// Issue #7 — a re-driven run that PARKS is not a failed re-drive
+// ===========================================================================
+
+describe('re-driven exit watcher × parked run (issue #7)', () => {
+  const NOW_MS = 1_700_000_000_000;
+  const NOW_S = 1_700_000_000;
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  function launchingRespawn(): { seam: RespawnSeam; exit(eventId: string, code: number): void } {
+    const ends = new Map<string, (exit: { code: number }) => void>();
+    const seam: RespawnSeam = async (event) => ({
+      result: 'spawned',
+      exited: new Promise<{ code: number }>((resolve) => ends.set(event.event_id, resolve)),
+    });
+    return { seam, exit: (eventId, code) => ends.get(eventId)!({ code }) };
+  }
+
+  /** A failed row WITH v9 attribution, so the watcher knows which run it launched. */
+  function seedFailedAttributed(eventId: string, runId: string): void {
+    db.acceptIngressEvent(eventId, 1000, { flowId: 'flowA', flowPath: '/flows/a.yaml', runId, substrateJson: '{}' });
+    db.incrementSpawnAttempts(eventId);
+    db.markIngressFailed(eventId);
+  }
+
+  function parkRun(runId: string, releaseAt: number): void {
+    db.insertRun({ run_id: runId, flow: '/flows/a.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    db.insertCard({ run_id: runId, id: 'c1', parent_id: null, lane: 'narrate', status: 'ready', attempt: 0, wave: 0, owned_paths: [], rework_count: 0 });
+    db.getStateDb().prepare('UPDATE cards SET release_at = $at WHERE run_id = $r').run({ $at: releaseAt, $r: runId });
+    // A real park also records WHY the card is gated: `release_at` alone cannot
+    // distinguish a provider cap from the fan-out cache-warming stagger, which
+    // stamps the same column.
+    db.appendCardLog({
+      runId,
+      kind: 'entered_lane',
+      cardId: 'c1',
+      station: 'narrate',
+      attempt: 0,
+      sourceLane: 'narrate',
+      destLane: 'narrate',
+      reasonClass: 'rate_limited',
+    });
+  }
+
+  function alerting(): { alerts: RedriveAlerting; seen: SpawnFailedAlert[] } {
+    const seen: SpawnFailedAlert[] = [];
+    return { seen, alerts: { alert: async (a) => { seen.push(a); }, channels: { flowA: '#a' }, globalAlertChannel: '#ops' } };
+  }
+
+  it('leaves the row spawned, logs parked, alerts informationally, and spends no further attempt', async () => {
+    seedFailedAttributed('e-park', 'run-park');
+    const slots = createRunSlots({ capacity: 1 });
+    const respawn = launchingRespawn();
+    const { alerts, seen } = alerting();
+
+    await redriveOnBoot({ db, respawn: respawn.seam, cap: CAP, slots, alerts, now: () => NOW_MS });
+    parkRun('run-park', NOW_S + 600);
+    respawn.exit('e-park', 1);
+    await settle();
+
+    // The incident's ingress_log: "spawn_failed — re-driven run exited with code 1".
+    expect(db.getIngressEvent('e-park')).toMatchObject({ spawn_state: 'spawned', spawn_attempts: 2 });
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'parked']);
+    expect(db.getIngressLog({ outcome: 'parked' })[0]!.reason).toContain(new Date((NOW_S + 600) * 1000).toISOString());
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.reason).toMatch(/^parked/);
+    expect(seen[0]).toMatchObject({ flowId: 'flowA', channel: '#a', eventId: 'e-park' });
+    // Not redrivable: a parked run is resumed, never re-driven.
+    expect(db.listRedrivable(CAP)).toEqual([]);
+    expect(slots.inFlightCount()).toBe(0);
+  });
+
+  it('does not hold the run slot on a park alert that never settles', async () => {
+    // The failure path already refuses to await its alert (see the exit-watcher
+    // test above) because the watcher releases the slot in a finally AFTER it.
+    // The park path runs through the same finally, so a stalled transport there
+    // would pin the slot for the life of the listener and defer every later
+    // launch — the durable ingress_log entry is written before the alert, so
+    // waiting for the send buys nothing.
+    seedFailedAttributed('e-park-hang', 'run-park-hang');
+    const slots = createRunSlots({ capacity: 1 });
+    const respawn = launchingRespawn();
+    const neverSettling: RedriveAlerting = {
+      alert: async () =>
+        new Promise<void>(() => {
+          /* never settles — simulates a stalled alert transport */
+        }),
+      channels: { flowA: '#a' },
+      globalAlertChannel: '#ops',
+    };
+
+    await redriveOnBoot({ db, respawn: respawn.seam, cap: CAP, slots, alerts: neverSettling, now: () => NOW_MS });
+    parkRun('run-park-hang', NOW_S + 600);
+    respawn.exit('e-park-hang', 1);
+
+    await Promise.race([
+      settle(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('exit watcher hung on a pending park alert')), 250)),
+    ]);
+
+    // The park is recorded durably and the slot is free for the next launch.
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'parked']);
+    expect(db.getIngressEvent('e-park-hang')!.spawn_state).toBe('spawned');
+    expect(slots.inFlightCount()).toBe(0);
+  });
+
+  it('keeps the failure path for a pre-v9 row with no run attribution, even if some run is parked', async () => {
+    seedFailed('e-legacy', 1); // no run_id
+    const respawn = launchingRespawn();
+    const { alerts, seen } = alerting();
+
+    await redriveOnBoot({ db, respawn: respawn.seam, cap: CAP, alerts, now: () => NOW_MS });
+    respawn.exit('e-legacy', 1);
+    await settle();
+
+    expect(db.getIngressEvent('e-legacy')!.spawn_state).toBe('failed');
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'spawn_failed']);
+    expect(seen[0]!.reason).toBe('re-driven run exited with code 1');
+  });
+
+  it('keeps the failure path for a genuine nonzero exit of an attributed run that is not parked', async () => {
+    seedFailedAttributed('e-dies', 'run-dies');
+    db.insertRun({ run_id: 'run-dies', flow: '/flows/a.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
+    const respawn = launchingRespawn();
+    const { alerts, seen } = alerting();
+
+    await redriveOnBoot({ db, respawn: respawn.seam, cap: CAP, alerts, now: () => NOW_MS });
+    respawn.exit('e-dies', 1);
+    await settle();
+
+    expect(db.getIngressEvent('e-dies')).toMatchObject({ spawn_state: 'failed', spawn_attempts: 2 });
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'spawn_failed']);
+    expect(seen[0]!.reason).toBe('re-driven run exited with code 1');
   });
 });

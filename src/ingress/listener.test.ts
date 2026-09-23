@@ -78,6 +78,8 @@ import {
   type ListenerConfig,
 } from './listener';
 import { createRunSlots } from './run-slots';
+import { deriveIngressRunId } from './run-id';
+import type { HitlResumeSpawn } from './adapters/slack-events';
 
 const NOW = 1_700_000_000_000;
 
@@ -517,6 +519,7 @@ function makeFakeSocketSeam() {
   return { seam, connections, openCalls };
 }
 
+/** A Slack ingress binding on the socket transport, as it appears in flow.yaml. */
 function socketIngress(channel: string, appTokenEnv = 'SLACK_APP_TOKEN'): Record<string, unknown> {
   return {
     type: 'slack',
@@ -1200,5 +1203,101 @@ describe('re-drive failure alerting is wired into both sweeps (#8)', () => {
         reason: 're-driven run exited with code 2',
       },
     ]);
+  });
+});
+
+// ===========================================================================
+// Issue #7 — the listener resumes a parked run; it does not bury it
+// ===========================================================================
+
+describe('parked-run resume (issue #7)', () => {
+  const NOW_S = NOW / 1000;
+
+  /** An ingress-launched run of flowA, parked the way cmdRun leaves it. */
+  function seedParkedIngressRun(eventId: string, releaseAt: number): string {
+    const runId = deriveIngressRunId(eventId);
+    db.acceptIngressEvent(eventId, NOW - 60_000, { flowId: 'flowA', flowPath: '/flows/a.yaml', runId, substrateJson: '{}' });
+    db.incrementSpawnAttempts(eventId);
+    db.markIngressSpawned(eventId);
+    db.insertRun({ run_id: runId, flow: '/flows/a.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    db.insertCard({ run_id: runId, id: 'c1', parent_id: null, lane: 'narrate', status: 'ready', attempt: 0, wave: 0, owned_paths: [], rework_count: 0 });
+    db.getStateDb().prepare('UPDATE cards SET release_at = $at WHERE run_id = $r').run({ $at: releaseAt, $r: runId });
+    // A real park also records WHY the card is gated: `release_at` alone cannot
+    // distinguish a provider cap from the fan-out cache-warming stagger, which
+    // stamps the same column.
+    db.appendCardLog({
+      runId,
+      kind: 'entered_lane',
+      cardId: 'c1',
+      station: 'narrate',
+      attempt: 0,
+      sourceLane: 'narrate',
+      destLane: 'narrate',
+      reasonClass: 'rate_limited',
+    });
+    return runId;
+  }
+
+  function recordingResume(): { seam: HitlResumeSpawn; calls: Array<{ flowPath: string; runId: string }> } {
+    const calls: Array<{ flowPath: string; runId: string }> = [];
+    // Never resolves: the resumed run is "still executing" for the whole test.
+    return { calls, seam: (req) => { calls.push(req); return new Promise(() => {}); } };
+  }
+
+  it('resumes a run that was parked at boot, once its gate has passed, on the boot sweep', async () => {
+    const runId = seedParkedIngressRun('evt-parked', NOW_S - 30);
+    const resume = recordingResume();
+    const respawned: string[] = [];
+    const flows = { '/flows/a.yaml': makeFlow(webhookIngress('/hooks/a'), '#a') };
+    const deps = makeDeps({
+      loadFlow: loadFlowFrom(flows),
+      resumeSpawn: resume.seam,
+      respawn: async (event) => { respawned.push(event.event_id); return 'spawned'; },
+    });
+
+    expectStarted(await startListener(deps, baseConfig({ allowlist: { flowA: '/flows/a.yaml' } })));
+
+    // `conduit resume`, not a re-driven `conduit run --run-id` (which only
+    // prints the run state and exits 0 for an existing run).
+    expect(resume.calls).toEqual([{ flowPath: '/flows/a.yaml', runId }]);
+    expect(respawned).toEqual([]);
+    expect(spawnCalls).toEqual([]);
+    expect(db.getIngressEvent('evt-parked')).toMatchObject({ spawn_state: 'spawned', spawn_attempts: 1 });
+  });
+
+  it('resumes a run that parked AFTER boot from the periodic tick, once its gate has passed', async () => {
+    let clock = NOW;
+    let tick: (() => void) | null = null;
+    const resume = recordingResume();
+    const flows = { '/flows/a.yaml': makeFlow(webhookIngress('/hooks/a'), '#a') };
+    const deps = makeDeps({
+      loadFlow: loadFlowFrom(flows),
+      resumeSpawn: resume.seam,
+      now: () => clock,
+      redriveSchedule: (fn) => { tick = fn; return { cancel: () => {} }; },
+    });
+    const listener = expectStarted(await startListener(deps, baseConfig({ allowlist: { flowA: '/flows/a.yaml' } })));
+    listener.redrive.start();
+
+    // Parks after boot, gate 10 minutes out.
+    const runId = seedParkedIngressRun('evt-later', NOW_S + 600);
+    tick!();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(resume.calls).toEqual([]); // not due yet
+
+    clock = NOW + 601_000;
+    tick!();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(resume.calls).toEqual([{ flowPath: '/flows/a.yaml', runId }]);
+    listener.redrive.stop();
+  });
+
+  it('resumes nothing at boot when no resume seam is wired (replies journal a manual resume)', async () => {
+    seedParkedIngressRun('evt-parked', NOW_S - 30);
+    const flows = { '/flows/a.yaml': makeFlow(webhookIngress('/hooks/a'), '#a') };
+    const deps = makeDeps({ loadFlow: loadFlowFrom(flows) });
+    expectStarted(await startListener(deps, baseConfig({ allowlist: { flowA: '/flows/a.yaml' } })));
+    expect(spawnCalls).toEqual([]);
+    expect(db.getIngressEvent('evt-parked')!.spawn_state).toBe('spawned');
   });
 });

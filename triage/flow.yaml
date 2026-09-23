@@ -1,0 +1,125 @@
+# triage — classify an incoming issue, scan it for prompt injection, apply a
+# bounded set of labels.
+#
+#   classify ──┐
+#              ├─> apply (deterministic, effectful)  -> done
+#   scan     ──┘
+#
+# Both transforms declare the SAME entry artifact (issue.json) as an input, and
+# both reference it as `{{issue.json}}`. That is deliberate: `scan` must see the
+# raw, attacker-authored text. If it only saw classify's output there would be
+# nothing left to detect. They are independent, so the linear order below is a
+# cost choice (scan first would skip the classify call on a hit), not a safety
+# one.
+#
+# The declaration is load-bearing, not decorative. A transform has no
+# filesystem: its prompt is built by substituting `{{artifact}}` placeholders
+# against the station's DECLARED inputs, and `conduit run --input` seeds the
+# entry artifact at the entry station's FIRST declared input. With `inputs: []`
+# the submission reaches neither station and both models classify an empty
+# prompt, silently. src/triage/flow-config.test.ts pins both halves.
+#
+# `scan` is NOT a gate station. A gate's remedy is rework, and re-running
+# classify on identical input changes nothing. The verdict is a routing input
+# consumed by `apply`, which is deterministic code in this repo
+# (src/triage/apply-triage.ts) — the only station that can write to GitHub.
+#
+
+# ⚠️ LOAD-BEARING: `classify` and `scan` MUST stay `kind: transform`.
+#
+# The run container holds GITHUB_TOKEN and CONDUIT_API_KEY in its environment
+# for the whole flow, including while these two stations execute. That is safe
+# for exactly one reason: a `transform` is one LLM call with typed data in and
+# out — no tools, no loop, no shell (SPEC §4). A model that cannot run anything
+# cannot be talked into reading the environment it runs in, however the issue
+# body is worded.
+#
+# Changing either station to `kind: agentic` — or adding any tool surface to
+# them — turns an anonymous, unreviewed GitHub issue body into code execution
+# against a token that can write to this repo's issues. There is no prompt that
+# makes that safe. If a triage station ever needs tools, the credentials must
+# leave the container first.
+
+flow: triage
+project_root: .
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 5
+    max_tokens: 60000
+  per_card:
+    max_execution_attempts: 2
+  liveness:
+    no_progress_minutes: 2
+
+defaults:
+  cap_policy: scrap
+
+terminal_lanes: [done, scrap, hold]
+
+channels:
+  ingress:
+    type: cli
+
+stations:
+  # Classify. Fills in fields whose legal values are fixed in advance; it never
+  # names an action. Mapping field -> label happens in `apply`.
+  - id: classify
+    worker:
+      kind: transform
+      role: triager
+      model: accounts/fireworks/models/glm-5p3-flash
+      prompt_file: prompts/classify.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: type, type: string, required: true }
+          - { name: area, type: string, required: false }
+          - { name: priority_suggestion, type: string, required: false }
+          - { name: possible_duplicate, type: number, required: false }
+          - { name: summary, type: string, required: true }
+    inputs: [issue.json]
+    outputs: [triage.json]
+    next: scan
+
+  # Injection scan. Separate call, separate prompt, no classification task
+  # attached — a model asked to classify AND self-report injection reports
+  # whatever the injection tells it to.
+  - id: scan
+    worker:
+      kind: transform
+      role: inspector
+      model: accounts/fireworks/models/glm-5p3-flash
+      prompt_file: prompts/scan.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: injection_detected, type: boolean, required: true }
+          - { name: evidence, type: string, required: true }
+    inputs: [issue.json]
+    outputs: [scan.json]
+    next: apply
+
+  # The security boundary. No model call. Validates both artifacts against a
+  # closed label allowlist and performs the only privileged write in the flow.
+  # effectful: true -> outbox + idempotency key, so a retry cannot double-post.
+  - id: apply
+    worker:
+      kind: deterministic
+      role: applier
+      command: bun
+      args: ["/app/src/triage/apply-triage.ts"]
+    effectful: true
+    inputs: []
+    outputs: [result.json]
+    next: done
+
+security:
+  bash:
+    allow: ["bun"]
+    deny_shell_metachars: true
+  # Egress is needed for the model gateway and api.github.com. The transforms
+  # have no tools, so reaching the network is not something they can be talked
+  # into doing.
+  network_egress: allow

@@ -32,6 +32,9 @@ import {
   type HarnessInvocation,
   type HarnessRegistry,
 } from '../worker/harness-adapter';
+import { createClaudeHarnessAdapter } from '../worker/harness-adapter-claude';
+import type { HarnessSpawnResult } from '../worker/harness-runner';
+import { getRunParkedRelease } from '../run/run-state';
 
 // ---------------------------------------------------------------------------
 // Shared executor-test recipe.
@@ -65,6 +68,12 @@ type Behavior =
   | { kind: 'invalid' }
   | { kind: 'throw'; code?: string; message: string };
 
+/**
+ * A harness adapter that replays `behaviors` in order, holding the last one
+ * once the script runs out — so a test can say "rate-limit the first call, then
+ * succeed" and let the executor drive as many calls as it needs. Every
+ * invocation is recorded for assertions about what the station was asked to do.
+ */
 function makeScriptedHarness(
   behaviors: Behavior | Behavior[],
   opts: { name?: string; outputName?: string } = {},
@@ -114,16 +123,45 @@ function makeScriptedHarness(
 // Flow fixture — one `coder` harness station, configurable attempt cap.
 // ---------------------------------------------------------------------------
 
+const CRITIC_MODEL = 'critic-model';
+
+/**
+ * Write a one-harness-station flow to `dir`, optionally `gated` (a check with a
+ * back-edge, so a rate limit can land on a REWORK invocation — the case issue
+ * #7 is about) and with the attempt/wall-clock budgets under test.
+ */
 function writeHarnessFlow(
   dir: string,
   registry: HarnessRegistry,
-  opts: { maxAttempts?: number; wallClockMinutes?: number } = {},
+  opts: {
+    maxAttempts?: number;
+    wallClockMinutes?: number;
+    harness?: string;
+    gated?: boolean;
+    effectful?: boolean;
+  } = {},
 ): FlowConfig {
   const maxAttempts = opts.maxAttempts ?? 2;
   const wallClockMinutes = opts.wallClockMinutes ?? 10;
+  const harness = opts.harness ?? 'fake-harness';
   mkdirSync(join(dir, 'prompts'), { recursive: true });
-  writeFileSync(join(dir, 'prompts', 'coder.md'), 'TASK: {{task.json}}');
+  // The loader rejects a {{feedback}} reference on a station nothing rejects
+  // back to, so the feedback input exists only on the gated shape.
+  writeFileSync(join(dir, 'prompts', 'coder.md'), opts.gated ? 'TASK: {{task.json}}\n{{feedback}}' : 'TASK: {{task.json}}');
+  writeFileSync(join(dir, 'prompts', 'verify.md'), 'Check {{result.json}}');
   writeFileSync(join(dir, 'task.json'), '{"task":"build the widget"}');
+
+  // Issue #7's shape needs a critic gate whose back-edge returns to the maker:
+  // the cap landed on the REWORK invocation, after the station had already
+  // succeeded once.
+  const gate = opts.gated
+    ? `
+    check:
+      kind: gate
+      critic: { role: critic, model: ${CRITIC_MODEL}, prompt_file: prompts/verify.md, prompt_version: "1" }
+      on_reject: coder
+      rework_cap: 3`
+    : '';
 
   const flowYaml = `
 flow: harness-failures
@@ -136,9 +174,10 @@ budgets:
 terminal_lanes: [done, scrap, hold]
 stations:
   - id: coder
+    effectful: ${opts.effectful ?? false}
     worker:
       kind: harness
-      harness: fake-harness
+      harness: ${harness}
       model: sonnet
       prompt_file: prompts/coder.md
       prompt_version: "1"
@@ -146,9 +185,9 @@ stations:
       output_schema:
         fields:
           - { name: summary, type: string, required: true }
-    inputs: [task.json]
+    inputs: [task.json${opts.gated ? ', feedback' : ''}]
     outputs: [result.json]
-    next: done
+    next: done${gate}
 `;
   writeFileSync(join(dir, 'flow.yaml'), flowYaml);
   const loaded = loadFlow(join(dir, 'flow.yaml'), { harnessRegistry: registry });
@@ -230,6 +269,7 @@ function virtualClock(startSeconds = 1000): {
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   read: () => number;
+  advance: (seconds: number) => void;
 } {
   let clock = startSeconds;
   return {
@@ -238,17 +278,22 @@ function virtualClock(startSeconds = 1000): {
       clock += Math.max(1, Math.ceil(ms / 1000));
     },
     read: () => clock,
+    advance: (seconds: number) => {
+      clock += seconds;
+    },
   };
 }
 
+/** Drive the real executor over `flow` on a virtual clock. */
 async function run(
   flow: FlowConfig,
   registry: HarnessRegistry,
   clock = virtualClock(),
+  opts: { adapter?: ModelAdapter; io?: typeof io } = {},
 ): Promise<void> {
   await runExecutor({
     db: db!, flow, now: clock.now, sleep: clock.sleep,
-    adapter: throwingModel, io, harnessRegistry: registry,
+    adapter: opts.adapter ?? throwingModel, io: opts.io ?? io, harnessRegistry: registry,
   } as unknown as RunEngineArgs);
 }
 
@@ -267,16 +312,16 @@ function rateLimited(resetAtMs?: number): Behavior {
   } as Behavior;
 }
 
-describe('issue #3 — a 429 parks the card rather than scrapping it', () => {
-  /**
-   * A wall-clock budget small enough that the consumption andon trips at the
-   * FIRST release-gate check. That halts the run while the card is still
-   * parked, which is both what we need in order to observe the parked state and
-   * a real guarantee worth pinning: a cap longer than the run's remaining
-   * budget must halt the run, not idle it until the gate opens.
-   */
-  const HALT_AT_FIRST_GATE = { maxAttempts: 5, wallClockMinutes: 0.001 };
+/**
+ * A wall-clock budget small enough that the consumption andon trips at the
+ * FIRST release-gate check. That halts the run while the card is still
+ * parked, which is both what we need in order to observe the parked state and
+ * a real guarantee worth pinning: a cap longer than the run's remaining
+ * budget must halt the run, not idle it until the gate opens.
+ */
+const HALT_AT_FIRST_GATE = { maxAttempts: 5, wallClockMinutes: 0.001 };
 
+describe('issue #3 — a 429 parks the card rather than scrapping it', () => {
   it('does NOT scrap: the card stays at its lane, ready to run again', async () => {
     db = openDb();
     const { adapter } = makeScriptedHarness(rateLimited());
@@ -431,8 +476,311 @@ describe('issue #3 — a 429 parks the card rather than scrapping it', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Issue #7 — the cap lands on a REWORK invocation, through the REAL adapter.
+// ---------------------------------------------------------------------------
+
+/**
+ * The claude-headless adapter driven by a scripted SPAWN, so the classification
+ * under test is the adapter's own (`isRateLimited`), not a stubbed throw. Each
+ * spawn consumes the next scripted result (the last one repeats); a success
+ * result also writes the declared output, since the executor collects it from
+ * disk.
+ */
+function makeScriptedClaudeSpawn(
+  results: Array<Partial<HarnessSpawnResult> & { stdout: string }>,
+  onSpawn: (n: number) => void = () => {},
+): { adapter: HarnessAdapter; spawns: number } {
+  const state = { spawns: 0 };
+  const adapter = createClaudeHarnessAdapter({
+    projectRoot: process.cwd(),
+    envAllowlist: [],
+    probe: async () => ({ present: true }),
+    run: async () => {
+      const scripted = results[Math.min(state.spawns, results.length - 1)]!;
+      state.spawns++;
+      onSpawn(state.spawns);
+      if ((scripted.exitCode ?? 0) === 0) {
+        writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'narrated' }), 'utf-8');
+      }
+      return { exitCode: 0, stderr: '', durationMs: 1, timedOut: false, ...scripted };
+    },
+  });
+  return {
+    adapter,
+    get spawns() {
+      return state.spawns;
+    },
+  };
+}
+
+/** The CLI's warning event at 0.99 of the five-hour window, reset `resetsAt` (epoch SECONDS). */
+function warningEvent(resetsAt: number): string {
+  return JSON.stringify({
+    type: 'rate_limit_event',
+    rate_limit_info: {
+      status: 'allowed_warning', rateLimitType: 'five_hour', utilization: 0.99, resetsAt, isUsingOverage: false,
+    },
+  });
+}
+
+const SUCCESS_RESULT = JSON.stringify({
+  type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0.01,
+  usage: { input_tokens: 10, output_tokens: 5 },
+});
+
+/** A critic that rejects its first verdict back to the maker, then passes. */
+function makeRejectOnceCritic(): ModelAdapter {
+  let rejected = false;
+  return {
+    async call(req) {
+      if (req.model !== CRITIC_MODEL) {
+        throw new Error(`unexpected model call for '${req.model}' — a harness maker must not call the model`);
+      }
+      const verdict = rejected
+        ? { verdict: 'pass', findings: [] }
+        : { verdict: 'reject', findings: ['tighten the second paragraph'], return_to: 'coder' };
+      rejected = true;
+      return { text: JSON.stringify(verdict), inputTokens: 5, outputTokens: 5, costUsd: 0.001 };
+    },
+  };
+}
+
+describe('issue #7 — a cap on the REWORK invocation parks the card (real adapter classification)', () => {
+  /** Thirty minutes out in REAL time, so the park lands on the provider's reset, not the default. */
+  const RESET_IN_SECONDS = 1800;
+
+  it('parks at the same lane with no attempt consumed, instead of scrapping the run', async () => {
+    db = openDb();
+    const clock = virtualClock(1000);
+    const resetsAt = Math.floor(Date.now() / 1000) + RESET_IN_SECONDS;
+    const claude = makeScriptedClaudeSpawn(
+      [
+        // First invocation succeeds at 0.99 utilization (the journal's allowed_warning).
+        { stdout: [warningEvent(resetsAt), SUCCESS_RESULT].join('\n') },
+        // The rework invocation dies on the cap: the kept warning line is all stdout
+        // holds, there is NO result event, and the cap is named only on stderr.
+        { stdout: warningEvent(resetsAt), exitCode: 1, stderr: "You've hit your usage limit · resets 8pm (UTC)" },
+      ],
+      // Real invocations take time. Moving the clock past the tiny wall-clock
+      // budget here makes the andon trip at the FIRST gate check, so the state
+      // under inspection is the first park — not a re-park after sleeping to it.
+      () => clock.advance(10),
+    );
+    const registry = createHarnessRegistry([claude.adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, {
+      ...HALT_AT_FIRST_GATE, harness: 'claude-headless', gated: true,
+    });
+    seedCoderCard(db);
+
+    await run(flow, registry, clock, { adapter: makeRejectOnceCritic() });
+
+    const card = getCard(db);
+    // The reported end state was lane=scrap, status=scrapped — the whole run
+    // lost to a valid rework with no headroom.
+    expect(card?.lane).toBe('coder');
+    expect(card?.status).toBe('ready');
+    // attempt=1 is the REWORK's own bump (advanceCard keys the next checkpoint
+    // on it); the park added nothing on top, and the rework counter shows the
+    // one legitimate reject.
+    expect(card?.attempt).toBe(1);
+    expect(card?.rework_count).toBe(1);
+    expect(terminalReasons(db)).toEqual([]);
+    // Parked, and on the provider's reset: 1800s ahead in the injected frame,
+    // not the 300s default a missing reset would fall back to. The park samples
+    // now() after the invoke, so its base lands inside the 10s the spawn advanced.
+    const releaseAt = releaseAtOf(db) ?? 0;
+    expect(releaseAt).toBeGreaterThanOrEqual(1000 + RESET_IN_SECONDS - 1);
+    expect(releaseAt).toBeLessThanOrEqual(1010 + RESET_IN_SECONDS + 2);
+    // One real run, one capped rework — never a retry loop burning the cap.
+    expect(claude.spawns).toBe(2);
+  });
+
+  it('CONTRAST: the same rework crash with an unrelated stderr still scraps', async () => {
+    db = openDb();
+    const resetsAt = Math.floor(Date.now() / 1000) + RESET_IN_SECONDS;
+    const claude = makeScriptedClaudeSpawn([
+      { stdout: [warningEvent(resetsAt), SUCCESS_RESULT].join('\n') },
+      { stdout: warningEvent(resetsAt), exitCode: 1, stderr: 'segfault' },
+    ]);
+    const registry = createHarnessRegistry([claude.adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { maxAttempts: 2, harness: 'claude-headless', gated: true });
+    seedCoderCard(db);
+
+    await run(flow, registry, virtualClock(1000), { adapter: makeRejectOnceCritic() });
+
+    expect(getCard(db)?.lane).toBe('scrap');
+    expect(terminalReasons(db)).toContain('harness-nonzero-exit');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #7 — a run that cannot afford to wait out the cap halts as PARKED.
+// ---------------------------------------------------------------------------
+
+describe('issue #7 — the andon halt during a rate-limit park is reported as parked', () => {
+  it('names the gate on stderr as ISO-8601 UTC and leaves the card exactly as parked', async () => {
+    db = openDb();
+    const clock = virtualClock(1000);
+    const { adapter } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, HALT_AT_FIRST_GATE);
+    seedCoderCard(db);
+    const errors: string[] = [];
+
+    await run(flow, registry, clock, { io: { out: () => {}, err: (l) => errors.push(l) } });
+
+    // The old line — "andon: run halted — wall_clock budget exceeded" — read as
+    // a runaway. This run did no work at all: it was told to wait, could not
+    // afford to, and stopped with every card intact.
+    const releaseAt = releaseAtOf(db);
+    expect(releaseAt).not.toBeNull();
+    const andon = errors.find((l) => /^andon:/.test(l));
+    expect(andon).toMatch(/parked behind a provider rate limit/);
+    expect(andon).toContain(new Date(releaseAt! * 1000).toISOString());
+    const card = getCard(db);
+    expect(card?.lane).toBe('coder');
+    expect(card?.status).toBe('ready');
+    expect(card?.attempt).toBe(0);
+    expect(releaseAt!).toBeGreaterThan(clock.read());
+  });
+});
+
+// ---------------------------------------------------------------------------
 // releaseAtForRateLimit — the units/clocks conversion, pinned exactly.
 // ---------------------------------------------------------------------------
+
+describe('issue #16 review — an endless cap escalates instead of parking forever', () => {
+  it('holds the card once the consecutive parks reach the cap, sparing no attempt on the way', async () => {
+    // A park spends no execution attempt, so NONE of the four rework guards
+    // bounds it: guard #1 skips a 'rate_limited' entry by design, guard #2's
+    // counter never moves, guard #3 has no findings to compare, and guard #4
+    // halts the RUN — which the ingress listener now resumes unattended with a
+    // fresh per-process budget. Without a bound on the parks themselves, a
+    // station whose failure is misread as a cap parks, wakes, fails and parks
+    // again forever, alerting once. So it escalates to `hold` instead.
+    db = openDb();
+    const { adapter, calls } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    // A budget generous enough that the andon does not halt the run first: the
+    // bound under test is the park count, not the wall clock.
+    const flow = writeHarnessFlow(projectDir, registry, { maxAttempts: 5, wallClockMinutes: 10_000 });
+    seedCoderCard(db);
+    const attemptBefore = getCard(db)?.attempt;
+
+    await run(flow, registry, virtualClock(1000));
+
+    const card = getCard(db);
+    // Exactly the cap: eleven parks, and the twelfth cap holds instead.
+    const parks = db
+      .getJournalSpansForRun(DEFAULT_RUN_ID, 'entry')
+      .filter((x) => x.attributes.outcome === 'harness-rate-limited');
+    expect(parks.length).toBe(12);
+    expect(card?.lane).toBe('hold');
+    // Held, NOT scrapped: nothing the card produced is thrown away, and a
+    // human decides what a cap that will not clear means.
+    expect(card?.status).toBe('held');
+    expect(card?.lane).not.toBe('scrap');
+    // The escalation names the repetition rather than the last 429, so the
+    // operator can tell "still capped" from "this is not really a cap".
+    const held = db
+      .getCardLogForRun(DEFAULT_RUN_ID, 'entry')
+      .filter((e) => e.kind === 'terminal');
+    expect(held.some((e) => e.kind === 'terminal' && /times in a row/.test(e.reason))).toBe(true);
+    // Every one of those cycles was a real park: the attempt counter is
+    // untouched, which is issue #3's guarantee and must survive this bound.
+    expect(card?.attempt).toBe(attemptBefore!);
+    expect(calls.length).toBeGreaterThan(1);
+  });
+
+  it('resets the streak when the station actually runs, so an intermittent cap never escalates', async () => {
+    db = openDb();
+    // Cap, cap, then succeed. The success writes its own <station>.harness span
+    // and breaks the streak, so the card finishes instead of accumulating
+    // toward the hold.
+    const { adapter } = makeScriptedHarness([
+      rateLimited(),
+      rateLimited(),
+      { kind: 'ok', output: { summary: 'built the widget' } } as Behavior,
+    ]);
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { maxAttempts: 5, wallClockMinutes: 10_000 });
+    seedCoderCard(db);
+
+    await run(flow, registry, virtualClock(1000));
+
+    const card = getCard(db);
+    expect(card?.lane).not.toBe('hold');
+    expect(card?.lane).toBe('done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An effectful harness station cannot park through a cap: the invoke IS the
+// billed/irreversible side effect, so a pending outbox intent of unknown
+// outcome must escalate rather than resume at the same idempotency key.
+//
+// A wall-clock budget of EXACTLY zero (not HALT_AT_FIRST_GATE's 0.001
+// minutes) is deliberate here: the release-gate andon check runs on the
+// injected clock BEFORE any sleep, so with any nonzero budget elapsed==0
+// still clears it and the run loop takes one more internal tick — which, for
+// an effectful station, is enough for reconcileOnResume to self-correct the
+// dangling intent to 'hold' within the SAME process before ever halting.
+// That masks the bug this test is for: a real deployment's budget is minutes
+// or hours, so the run halts on the FIRST park, is reported 'parked', and
+// only a SEPARATE resumed process ever reaches the reconcile check. Zero
+// forces the halt at that same first park, so the test observes exactly the
+// state a real halt-then-resume would leave behind.
+// ---------------------------------------------------------------------------
+
+const HALT_ON_FIRST_PARK = { maxAttempts: 5, wallClockMinutes: 0 };
+
+describe('effectful harness station + rate limit — a pending intent cannot be parked through', () => {
+  it('holds the card instead of parking, and the run does not read as resumable', async () => {
+    db = openDb();
+    const { adapter } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { ...HALT_ON_FIRST_PARK, effectful: true });
+    seedCoderCard(db);
+
+    await run(flow, registry);
+
+    const card = getCard(db);
+    // Not parked: parking would resume the card at the SAME idempotency key
+    // (flow.version:card:station:attempt, since a park spends no attempt),
+    // and reconcileOnResume can only ever answer 'escalate_hold' for a
+    // pending intent of unknown outcome — so parking here would just relabel
+    // this same hold one dispatch later, while advertising the run as
+    // resumable in between.
+    expect(card?.lane).toBe('hold');
+    expect(card?.status).toBe('held');
+    expect(releaseAtOf(db)).toBeNull();
+
+    const reasons = terminalReasons(db);
+    expect(reasons.some((r) => /outbox intent/.test(r) && /manual reconciliation/.test(r))).toBe(true);
+
+    // The run must not be reported 'parked' — that is what puts a run on the
+    // ingress listener's unattended resume path, and resuming here would
+    // dispatch straight back into the same escalate_hold.
+    expect(getRunParkedRelease(db, DEFAULT_RUN_ID, 100_000)).toBeNull();
+  });
+
+  it('still journals the rate-limit span even though it escalates instead of parking', async () => {
+    db = openDb();
+    const { adapter } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { ...HALT_ON_FIRST_PARK, effectful: true });
+    seedCoderCard(db);
+
+    await run(flow, registry);
+
+    // The journal span is the record of what happened at the provider and is
+    // written the same way regardless of what the executor does next.
+    const spans = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry');
+    const parked = spans.find((s) => s.name === 'coder.harness');
+    expect(parked?.usageUnknown).toBe(true);
+    expect(JSON.stringify(parked?.attributes)).toMatch(/harness-rate-limited/);
+  });
+});
 
 describe('releaseAtForRateLimit', () => {
   const REAL_NOW_MS = 1_700_000_000_000;

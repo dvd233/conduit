@@ -27,7 +27,7 @@ import { openConduitDB, DEFAULT_RUN_ID } from '../persistence/db';
 import { validateRunId } from '../run/run-id';
 import { registerRun, computeFingerprint } from '../run/run-registry';
 import { acquireRunLease, releaseRunLease, peekRunLeaseHolder, defaultIsPidAlive } from '../run/run-lock';
-import { getRunState, type RunStateResult } from '../run/run-state';
+import { getRunState, getRunParkedRelease, formatParkedRun, type RunStateResult } from '../run/run-state';
 import type { ModelAdapter, ModelCall, ModelResponse } from '../worker/adapter';
 import {
   buildHarnessDefinitionRegistry,
@@ -559,6 +559,34 @@ export function updateRunStatus(
 }
 
 /**
+ * Record how the engine left a run, and — when it parked — tell the operator
+ * when and how to continue (issue #7).
+ *
+ * A run whose every unfinished card is waiting on a provider reset stays
+ * `'halted'` (so the resume sweep still selects it) but is recorded with
+ * outcome `'parked'`: nothing failed, and the andon that stopped it only
+ * bounded how long the process would wait. Recording it as a plain halt
+ * printed a "did not reach done" failure summary for a run that was merely
+ * told to come back later. The predicate lives in one place
+ * (getRunParkedRelease) so run and resume cannot drift apart.
+ *
+ * Returns whether the run parked, so cmdRun can keep its failure summary for
+ * the halts that ARE failures.
+ */
+function recordRunExit(deps: CliDeps, runId: string, completed: boolean, flowPath: string): { parked: boolean } {
+  if (completed) {
+    updateRunStatus(deps.db, runId, 'done', 'complete');
+    return { parked: false };
+  }
+  const parked = getRunParkedRelease(deps.db, runId, deps.now());
+  updateRunStatus(deps.db, runId, 'halted', parked !== null ? 'parked' : 'halted');
+  if (parked !== null) {
+    deps.io.err(`run ${JSON.stringify(runId)} ${formatParkedRun(runId, flowPath, parked.releaseAt)}`);
+  }
+  return { parked: parked !== null };
+}
+
+/**
  * Argument vector (after `run`) for a subflow child invocation (the original multi-flow engine work).
  * Pure and exported so the production seam's CLI contract is unit-testable:
  * the child gets its derived run id, the PARENT's project root (v1 contract —
@@ -624,6 +652,8 @@ export function formatRunState(runId: string, state: RunStateResult): string {
       return `run ${runId}: running`;
     case 'held':
       return `run ${runId}: held (${state.heldCards.length} held card${state.heldCards.length === 1 ? '' : 's'})`;
+    case 'parked':
+      return `run ${runId}: ${formatParkedRun(runId, state.flow, state.releaseAt)}`;
     case 'terminal':
       return `run ${runId}: terminal (outcome=${state.outcome})`;
   }
@@ -767,6 +797,16 @@ function printHaltedRunSummary(deps: CliDeps, runId: string): void {
 // Command handlers
 // ---------------------------------------------------------------------------
 
+/**
+ * `conduit run <flow.yaml>` — seed a run (or pick up an existing one by
+ * `--run-id`) and drive the engine to a terminal state.
+ *
+ * Exit code is the run's verdict (FR-12): 0 when the work reached `done`, 1
+ * otherwise. "Otherwise" is not always a failure — a run every unfinished card
+ * of which is parked behind a provider reset exits 1 too, and is recorded
+ * `outcome='parked'` so it stays resumable. Only a genuinely halted run gets
+ * the stuck-card summary; a parked one has no failed card to list.
+ */
 async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   // ── Parse flags: run <flow.yaml> [--input <file>] [--input-inline <text>] [--concurrency <n>] [--run-id <id>] [--project-root <dir>] ──
   let flowPath: string | undefined;
@@ -1021,7 +1061,7 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
       deps.io.err(formatRunLeaseConflict(effectiveRunId, holder.holderPid));
       return 1;
     }
-    const state = getRunState(deps.db, effectiveRunId);
+    const state = getRunState(deps.db, effectiveRunId, deps.now());
     deps.io.out(formatRunState(effectiveRunId, state));
     return 0;
   }
@@ -1193,15 +1233,11 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
     // We seeded exactly one card — check whether it reached the 'done' terminal.
     const card = deps.db.getCard(effectiveRunId, seededCardId);
     const completed = card?.lane === 'done';
-    updateRunStatus(
-      deps.db,
-      effectiveRunId,
-      completed ? 'done' : 'halted',
-      completed ? 'complete' : 'halted',
-    );
+    const { parked } = recordRunExit(deps, effectiveRunId, completed, resolvedFlowPath);
     // The original silent deterministic-failure work: exit 1 alone is a silent failure — print which card(s) are
-    // stuck in scrap/hold (or a non-terminal lane) before returning.
-    if (!completed) printHaltedRunSummary(deps, effectiveRunId);
+    // stuck in scrap/hold (or a non-terminal lane) before returning. A parked
+    // run has no failed card to list — its notice was printed above.
+    if (!completed && !parked) printHaltedRunSummary(deps, effectiveRunId);
     return completed ? 0 : 1;
   }
 
@@ -1213,18 +1249,30 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
     .prepare("SELECT COUNT(*) AS n FROM cards WHERE run_id = $run_id AND lane != 'done'")
     .get({ $run_id: effectiveRunId }) as { n: number };
   const completed = notAtDone === 0;
-  updateRunStatus(
-    deps.db,
-    effectiveRunId,
-    completed ? 'done' : 'halted',
-    completed ? 'complete' : 'halted',
-  );
+  const { parked } = recordRunExit(deps, effectiveRunId, completed, resolvedFlowPath);
   // The original silent deterministic-failure work: exit 1 alone is a silent failure — print which card(s) are
-  // stuck in scrap/hold (or a non-terminal lane) before returning.
-  if (!completed) printHaltedRunSummary(deps, effectiveRunId);
+  // stuck in scrap/hold (or a non-terminal lane) before returning. A parked
+  // run has no failed card to list — its notice was printed above.
+  if (!completed && !parked) printHaltedRunSummary(deps, effectiveRunId);
   return completed ? 0 : 1;
 }
 
+/**
+ * `conduit resume <flow.yaml>` — re-drive a run that stopped before its work
+ * was done, whether it was interrupted, halted, or parked on a rate limit.
+ *
+ * Resume runs in a FRESH process, so it first repairs what the dead one left
+ * behind: orphaned in-flight workers are reclaimed to `interrupted`, and any
+ * pending outbox intent is escalated to `hold` rather than blind-retried
+ * (SPEC §5) — a human decides whether the effect landed. Then the engine runs.
+ *
+ * Unlike `cmdRun`, the exit code is NOT the run's verdict: resume returns 0
+ * whenever it drove the engine at all, reserving non-zero for the reasons it
+ * could not start (an unknown run, a lease conflict, a bad flow). Callers that
+ * need the verdict read the `runs` row — which is what the ingress listener's
+ * parked-resume supervisor does, precisely because a halted or re-parked run
+ * still exits 0 here.
+ */
 async function cmdResume(argv: string[], deps: CliDeps): Promise<number> {
   // Parse: resume [--rebind] [--run <id>] [--concurrency <n>] [--project-root <dir>] <flow.yaml>
   let hasRebind = false;
@@ -1420,14 +1468,14 @@ async function cmdResume(argv: string[], deps: CliDeps): Promise<number> {
     // #2: advance the runs row to a terminal status on resume completion so a
     // finished run is no longer re-selected by the bare-resume sweep (status NOT
     // IN terminal) and getRunState reports a real outcome. A run with any card
-    // still off the 'done' lane (held / stalled) stays 'halted' — RESUMABLE —
-    // rather than 'done'.
+    // still off the 'done' lane (held / stalled / parked) stays 'halted' —
+    // RESUMABLE — rather than 'done'.
     const { n: notAtDone } = deps.db
       .getStateDb()
       .prepare("SELECT COUNT(*) AS n FROM cards WHERE run_id = $run_id AND lane != 'done'")
       .get({ $run_id: runId }) as { n: number };
     const completed = notAtDone === 0;
-    updateRunStatus(deps.db, runId, completed ? 'done' : 'halted', completed ? 'complete' : 'halted');
+    recordRunExit(deps, runId, completed, resolve(flowPath));
   }
 
   return 0;
@@ -2113,7 +2161,7 @@ async function cmdRunManage(argv: string[], deps: CliDeps): Promise<number> {
   }
 
   if (sub === 'status') {
-    const state = getRunState(deps.db, runId);
+    const state = getRunState(deps.db, runId, deps.now());
     deps.io.out(formatRunState(runId, state));
     // A not_found run is a non-zero (lookup miss) outcome; everything else is 0.
     return state.status === 'not_found' ? 1 : 0;

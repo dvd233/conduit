@@ -123,6 +123,46 @@ export interface HarnessResult {
   usage: UsageReport;
 }
 
+/**
+ * A harness invocation that FAILED but was still BILLED (issue #26 AC5).
+ *
+ * A timeout or a non-zero exit does not refund the tokens already consumed —
+ * the provider charged for whatever the call did before it died. An adapter
+ * that can still recover a usage figure at that point attaches it here rather
+ * than throwing it away, so the executor folds real spend into the run/wave
+ * budgets instead of recording a failed-and-therefore-free call.
+ *
+ * `code` is the existing failure-class tag ('harness-timeout',
+ * 'harness-nonzero-exit', 'harness-rate-limited') the executor already keys on.
+ *
+ * NOT every failure can carry usage, and that is not a defect: claude-headless
+ * reports usage only in a terminal `result` event, so a call killed at the
+ * wall-clock bound genuinely has no figure to recover. Absent `usage` stays
+ * honestly unknown — never a fabricated zero.
+ */
+export interface BilledHarnessError extends Error {
+  code?: string;
+  usage?: UsageReport;
+}
+
+/**
+ * The single reader for usage attached to a harness throw (issue #26 AC5).
+ *
+ * Every site that catches a harness invocation goes through HERE rather than
+ * casting and reaching for `.usage` itself, so the shape can never skew between
+ * the maker path and the critic path.
+ *
+ * Returns undefined when the throw carried nothing — which the caller must
+ * treat as UNKNOWN usage, not as zero.
+ */
+export function usageFromThrow(err: unknown): UsageReport | undefined {
+  if (typeof err !== 'object' || err === null) return undefined;
+  const usage = (err as BilledHarnessError).usage;
+  if (typeof usage !== 'object' || usage === null) return undefined;
+  if ('unknown' in usage) return usage.unknown === true ? { unknown: true } : undefined;
+  return typeof usage.tokens === 'number' && typeof usage.cost === 'number' ? usage : undefined;
+}
+
 /** Result of probing a harness adapter's underlying binary without invoking it. */
 export interface BinaryProbe {
   /** True when the configured binary is present and executable. */

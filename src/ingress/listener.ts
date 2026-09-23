@@ -14,7 +14,9 @@
  *   4. Parse each binding and build the webhook-route and slack-channel maps;
  *      resolve app tokens for socket-transport slack flows (the original Slack Socket Mode work) — an
  *      unset app token or a missing socket seam is a boot error.
- *   5. Run redriveOnBoot (WI-407) — completes BEFORE the listener is returned.
+ *   5. Run redriveOnBoot (WI-407) — completes BEFORE the listener is returned —
+ *      then resume any parked ingress run whose gate has passed (issue #7,
+ *      ./parked.ts); the periodic sweep repeats both.
  *      Both re-drive paths (boot + periodic sweep) get the alert seam and the
  *      per-flow channels resolved in step 3, so a re-driven failure alerts the
  *      way a hot-path failure does (#8).
@@ -61,10 +63,16 @@ import {
   type SocketModeClient,
 } from './adapters/slack-socket';
 import type { SpawnPathDeps, SpawnSeam, AlertSeam } from './spawn';
-import { createRunSlots, type RunSlots } from './run-slots';
+import { createRunSlots } from './run-slots';
+import { runGatedHitlResume } from './gated-resume';
+import { resumeDueParkedRuns } from './parked';
 import type { ConduitDB } from '../persistence/db';
 import type { LoadFlowResult } from '../flow/load';
 import type { FlowConfig } from '../types/kernel';
+
+// Re-exported for the listener's tests: the gate moved to its own module when
+// the parked-run resume (issue #7) needed the same gate WITHOUT the HITL bypass.
+export { runGatedHitlResume } from './gated-resume';
 
 // ---------------------------------------------------------------------------
 // Public types (pinned by listener.test.ts)
@@ -419,6 +427,7 @@ export async function startListener(
     globalAlertChannel: config.globalAlertChannel ?? '',
     redriveCap: deps.redriveCap,
     slots: runSlots,
+    now: deps.now,
   };
 
   // ── Phase 4a: Resolve socket-transport requirements per flow ─────────────
@@ -551,7 +560,27 @@ export async function startListener(
     cap: deps.redriveCap,
     slots: runSlots,
     alerts: redriveAlerts,
+    now: deps.now,
   });
+
+  // Parked-run resume (issue #7): a run halted behind a provider rate limit is
+  // `conduit resume`d — never re-driven — once its gate passes. Runs here after
+  // the boot re-drive (a listener restarted mid-wait still resumes) and again
+  // after every periodic sweep. Launch-only, like the sweep: each resume is
+  // supervised detached, holding its run slot until the child exits.
+  const resumeSpawn = deps.resumeSpawn;
+  const resumeParked =
+    resumeSpawn !== undefined
+      ? () =>
+          resumeDueParkedRuns({
+            db: deps.db,
+            slots: runSlots,
+            resumeSpawn,
+            alerts: redriveAlerts,
+            now: deps.now,
+          })
+      : undefined;
+  await resumeParked?.();
 
   // ── Phase 6: Build and return the wired listener ─────────────────────────
   const webhookAdapterDeps: WebhookAdapterDeps = {
@@ -629,9 +658,11 @@ export async function startListener(
           cap: deps.redriveCap,
           slots: runSlots,
           alerts: redriveAlerts,
+          now: deps.now,
           intervalMs: deps.redriveIntervalMs ?? 60_000,
           ...(deps.redriveSchedule !== undefined && { schedule: deps.redriveSchedule }),
           ...(deps.onRedriveSweep !== undefined && { onSweep: deps.onRedriveSweep }),
+          ...(resumeParked !== undefined && { afterSweep: resumeParked }),
         });
       },
       stop: () => {
@@ -642,51 +673,4 @@ export async function startListener(
   };
 
   return { ok: true, listener };
-}
-
-// ---------------------------------------------------------------------------
-// HITL resume × run-slot gate (the original listener-backpressure work × the original HITL reply-and-resume work)
-// ---------------------------------------------------------------------------
-
-/**
- * Run a HITL-reply resume with OPPORTUNISTIC slot participation — a deliberate
- * decision from the pre-public run-slot and HITL review, not an accident of wiring:
- *
- *   - Slot free   → the resume claims it (`hitl-resume:<runId>`), so run-slot
- *     accounting stays honest in the common case: a resumed run is a real
- *     process against the same serial model box.
- *   - Saturated   → the resume proceeds ANYWAY (bypass). A pick resumes work
- *     that was already admitted once, arrives at human latency, and queueing a
- *     human's selection behind a photo backlog would read as a broken reply
- *     loop. Under saturation `max_concurrent_runs` can therefore be exceeded
- *     by in-flight resumes — bounded by the number of parked runs.
- *   - A resume for the SAME run already in flight → suppressed (logged as
- *     'duplicate'). Two `conduit resume` processes driving one run is the
- *     double-driver failure mode; the run lease would reject the loser anyway,
- *     so suppression only saves the doomed spawn. (Bypassed resumes are not
- *     registered, so saturation-time duplicates still fall through to the
- *     lease — same protection, one step later.)
- */
-export async function runGatedHitlResume(
-  slots: RunSlots,
-  db: ConduitDB,
-  runId: string,
-  resume: () => Promise<void>,
-): Promise<void> {
-  const slotId = `hitl-resume:${runId}`;
-  const acquisition = slots.tryAcquire(slotId);
-  if (acquisition === 'duplicate') {
-    db.appendIngressLog({
-      source: 'slack-hitl-reply',
-      eventId: null,
-      outcome: 'duplicate',
-      reason: `a resume for run '${runId}' is already in flight — suppressed`,
-    });
-    return;
-  }
-  try {
-    await resume();
-  } finally {
-    if (acquisition === 'acquired') slots.release(slotId);
-  }
 }

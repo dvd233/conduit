@@ -474,6 +474,247 @@ describe('runHarnessGateCheck (agentic critic, a pre-public engine review @queso
 });
 
 // ===========================================================================
+// runHarnessGateCheck — issue #26: a harness critic is a billed agentic
+// invocation, and the real usage/cost the adapter reported (or, on a throw,
+// whatever usageFromThrow recovers) was being dropped on the floor and every
+// StationOutput hardcoded usage: {tokens:0, cost:0} — invisible to every
+// budget meant to bound it. Separately, config.model never reached
+// HarnessInvocation.model, so a station override silently had no effect.
+// ===========================================================================
+
+describe('runHarnessGateCheck (issue #26 — usage, cost, and model threading)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'conduit-harness-gate-usage-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function harnessAdapter(
+    onInvoke: (call: HarnessInvocation) => Promise<HarnessResult> | HarnessResult,
+    name = 'fake-critic',
+  ): HarnessAdapter {
+    return {
+      name,
+      reportsUsage: true,
+      canRestrictTools: true,
+      async probeBinary() {
+        return { present: true };
+      },
+      async invoke(call) {
+        return onInvoke(call);
+      },
+    };
+  }
+
+  function harnessAdapterCapturing(
+    onInvoke: (call: HarnessInvocation) => Promise<HarnessResult> | HarnessResult,
+  ): { adapter: HarnessAdapter; calls: HarnessInvocation[] } {
+    const calls: HarnessInvocation[] = [];
+    const adapter = harnessAdapter((call) => {
+      calls.push(call);
+      return onInvoke(call);
+    });
+    return { adapter, calls };
+  }
+
+  function harnessGateConfig(
+    over: Partial<HarnessGateConfig> & { harnessAdapter: HarnessAdapter },
+  ): HarnessGateConfig {
+    return {
+      cardId: 'card-1',
+      station: 'gate',
+      attempt: 0,
+      prompt: 'Critique the draft.',
+      criticInputScope: [],
+      projectRoot: dir,
+      timeoutMs: 5000,
+      onReject: 'draft',
+      validBackEdges: BACK_EDGES,
+      ...over,
+    };
+  }
+
+  function writeVerdict(text: string): void {
+    writeFileSync(join(dir, 'verdict.json'), text, 'utf-8');
+  }
+
+  it('a PASS verdict carries the adapter\'s real usage.tokens/usage.cost into the StationOutput, not zero (AC1)', async () => {
+    const adapter = harnessAdapter(() => {
+      writeVerdict(JSON.stringify({ verdict: 'pass', findings: [] }));
+      return { outputs: [], usage: { tokens: 12345, cost: 0.42 } };
+    });
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const pass = expectGate(decision, 'pass');
+    expect(pass.output.usage).toEqual({ tokens: 12345, cost: 0.42 });
+  });
+
+  it('a REJECT verdict likewise carries the adapter\'s real usage into the StationOutput (AC1)', async () => {
+    const adapter = harnessAdapter(() => {
+      writeVerdict(JSON.stringify({ verdict: 'reject', findings: ['unsafe cast'], return_to: 'draft' }));
+      return { outputs: [], usage: { tokens: 777, cost: 0.05 } };
+    });
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const rejected = expectGate(decision, 'reject');
+    expect(rejected.output.usage).toEqual({ tokens: 777, cost: 0.05 });
+  });
+
+  it('an adapter reporting { unknown: true } propagates as unknown, never flattened to a fabricated zero (AC2)', async () => {
+    const adapter = harnessAdapter(() => {
+      writeVerdict(JSON.stringify({ verdict: 'pass', findings: [] }));
+      return { outputs: [], usage: { unknown: true } };
+    });
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const pass = expectGate(decision, 'pass');
+    expect('unknown' in pass.output.usage).toBe(true);
+  });
+
+  it('config.model reaches HarnessInvocation.model verbatim (AC4)', async () => {
+    const { adapter, calls } = harnessAdapterCapturing(() => {
+      writeVerdict(JSON.stringify({ verdict: 'pass', findings: [] }));
+      return { outputs: [], usage: { unknown: true } };
+    });
+
+    await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter, model: 'claude-opus-4' }));
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].model).toBe('claude-opus-4');
+  });
+
+  it('omitting config.model leaves HarnessInvocation.model absent, so the adapter falls through to its own default (AC4)', async () => {
+    const { adapter, calls } = harnessAdapterCapturing(() => {
+      writeVerdict(JSON.stringify({ verdict: 'pass', findings: [] }));
+      return { outputs: [], usage: { unknown: true } };
+    });
+
+    await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    expect(calls[0].model).toBeUndefined();
+  });
+
+  it('attaches criticUsage (adapterName + a non-negative durationMs) on a pass (AC5)', async () => {
+    const adapter = harnessAdapter(() => {
+      writeVerdict(JSON.stringify({ verdict: 'pass', findings: [] }));
+      return { outputs: [], usage: { tokens: 1, cost: 0.001 } };
+    }, 'critic-x');
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const pass = expectGate(decision, 'pass');
+    expect(pass.criticUsage?.adapterName).toBe('critic-x');
+    expect(typeof pass.criticUsage?.durationMs).toBe('number');
+    expect(pass.criticUsage!.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('attaches criticUsage on a reject (AC5)', async () => {
+    const adapter = harnessAdapter(() => {
+      writeVerdict(JSON.stringify({ verdict: 'reject', findings: ['unsafe cast'], return_to: 'draft' }));
+      return { outputs: [], usage: { tokens: 1, cost: 0.001 } };
+    }, 'critic-x');
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const rejected = expectGate(decision, 'reject');
+    expect(rejected.criticUsage?.adapterName).toBe('critic-x');
+    expect(typeof rejected.criticUsage?.durationMs).toBe('number');
+    expect(rejected.criticUsage!.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('attaches criticUsage on harness-critic-verdict-missing — the invoke still ran and was billed (AC5)', async () => {
+    const adapter = harnessAdapter(() => ({ outputs: [], usage: { tokens: 5, cost: 0.0001 } })); // never writes verdict.json
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const scrapped = expectGate(decision, 'scrapped');
+    expect(scrapped.reason).toMatch(/^harness-critic-verdict-missing:/);
+    expect(scrapped.criticUsage?.adapterName).toBe('fake-critic');
+    expect(typeof scrapped.criticUsage?.durationMs).toBe('number');
+  });
+
+  it('attaches criticUsage on harness-critic-verdict-unparseable (AC5)', async () => {
+    const adapter = harnessAdapter(() => {
+      writeVerdict('the critic wrote prose instead of JSON, no braces here');
+      return { outputs: [], usage: { tokens: 5, cost: 0.0001 } };
+    });
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const scrapped = expectGate(decision, 'scrapped');
+    expect(scrapped.reason).toMatch(/^harness-critic-verdict-unparseable:/);
+    expect(scrapped.criticUsage?.adapterName).toBe('fake-critic');
+    expect(typeof scrapped.criticUsage?.durationMs).toBe('number');
+  });
+
+  it('attaches criticUsage on a schema-invalid verdict (AC5)', async () => {
+    const adapter = harnessAdapter(() => {
+      writeVerdict(JSON.stringify({ verdict: 'maybe', findings: [] }));
+      return { outputs: [], usage: { tokens: 5, cost: 0.0001 } };
+    });
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const scrapped = expectGate(decision, 'scrapped');
+    expect(scrapped.reason).toMatch(/^harness-critic-verdict-invalid:/);
+    expect(scrapped.criticUsage?.adapterName).toBe('fake-critic');
+    expect(typeof scrapped.criticUsage?.durationMs).toBe('number');
+  });
+
+  it('an adapter that throws a plain error still scraps harness-critic-invoke-failed, with unknown criticUsage (AC5)', async () => {
+    const adapter = harnessAdapter(() => {
+      throw new Error('agent CLI crashed');
+    });
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const scrapped = expectGate(decision, 'scrapped');
+    expect(scrapped.reason).toMatch(/^harness-critic-invoke-failed:/);
+    expect(scrapped.criticUsage?.usage).toEqual({ unknown: true });
+  });
+
+  it('an adapter that throws with billed usage attached still scraps but folds the real numbers into criticUsage (AC5)', async () => {
+    const billedErr = Object.assign(new Error('boom'), {
+      code: 'harness-nonzero-exit',
+      usage: { tokens: 900, cost: 0.03 },
+    });
+    const adapter = harnessAdapter(() => {
+      throw billedErr;
+    });
+
+    const decision = await runHarnessGateCheck(harnessGateConfig({ harnessAdapter: adapter }));
+
+    const scrapped = expectGate(decision, 'scrapped');
+    expect(scrapped.reason).toMatch(/^harness-critic-invoke-failed:/);
+    expect(scrapped.criticUsage?.usage).toEqual({ tokens: 900, cost: 0.03 });
+  });
+
+  it(
+    'runGateCheck (the TRANSFORM critic) never populates criticUsage — its usage is already folded into the ' +
+      'run/wave budgets via runTransformStation\'s trackingAdapter, so a criticUsage here would double-count ' +
+      'the same spend the maker-path accumulators already saw (regression)',
+    async () => {
+      const passStub = makeStubAdapter([resp('{"verdict":"pass","findings":[]}')]);
+      const passDecision = expectGate(await runGateCheck(gateConfig({ adapter: passStub.adapter })), 'pass');
+      expect(passDecision.criticUsage).toBeUndefined();
+
+      const rejectStub = makeStubAdapter([
+        resp('{"verdict":"reject","findings":["unsafe cast"],"return_to":"draft"}'),
+      ]);
+      const rejectDecision = expectGate(await runGateCheck(gateConfig({ adapter: rejectStub.adapter })), 'reject');
+      expect(rejectDecision.criticUsage).toBeUndefined();
+    },
+  );
+});
+
+// ===========================================================================
 // RANK — curate into a selection, NEVER auto-pick (AC4, AC5, AC6)
 // ===========================================================================
 

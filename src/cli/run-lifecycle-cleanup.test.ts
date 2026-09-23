@@ -17,8 +17,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'node:path';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { mkdirSync } from 'node:fs';
 import { openConduitDB, DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import type { ModelAdapter } from '../worker/adapter';
+import { createHarnessRegistry, type HarnessAdapter } from '../worker/harness-adapter';
+import { runExecutor } from '../controller/executor';
 import { main, type CliDeps, type CliIO, type RunEngineArgs } from './main';
 
 // ---------------------------------------------------------------------------
@@ -346,5 +349,264 @@ describe('#11 existing-run path formatting', () => {
     expect(out).toContain('job-f');
     // The old behaviour dumped JSON.stringify(state) — assert no object braces.
     expect(out).not.toMatch(/[{}]/);
+  });
+});
+
+// ===========================================================================
+// Issue #7 — a run halted while every card waits on a provider reset is PARKED
+// ===========================================================================
+
+/**
+ * A virtual clock the REAL runExecutor drives: the injected sleep advances it,
+ * so the release-gate wait re-ticks without burning wall-clock (the idiom the
+ * executor's rate-limit tests use).
+ */
+function virtualClock(start = 1000): { now: () => number; sleep: (ms: number) => Promise<void> } {
+  let clock = start;
+  return {
+    now: () => clock,
+    sleep: async (ms: number) => {
+      clock += Math.max(1, Math.ceil(ms / 1000));
+    },
+  };
+}
+
+/** A harness that is capped on every invocation — what claude-headless throws on a 429. */
+const cappedHarness: HarnessAdapter = {
+  name: 'fake-harness',
+  reportsUsage: true,
+  canRestrictTools: true,
+  async probeBinary() {
+    return { present: true };
+  },
+  async invoke() {
+    throw Object.assign(new Error("claude-headless: provider rate limit: You've hit your usage limit"), {
+      code: 'harness-rate-limited',
+    });
+  },
+};
+
+/**
+ * One harness station with a wall-clock budget too small to wait out any park:
+ * the consumption andon trips at the release-gate check and the run halts with
+ * the card still parked.
+ */
+function writeParkingFlow(): string {
+  mkdirSync(join(flowRoot, 'prompts'), { recursive: true });
+  writeFileSync(join(flowRoot, 'prompts', 'narrate.md'), 'TASK: {{task.json}}', 'utf-8');
+  const yaml = `flow: vertical
+flow_version: 1
+project_root: .
+budgets:
+  run: { wall_clock_minutes: 0.001, max_tokens: 100000 }
+  per_card: { max_execution_attempts: 5 }
+terminal_lanes: [done, scrap, hold]
+stations:
+  - id: narrate
+    worker:
+      kind: harness
+      harness: fake-harness
+      model: sonnet
+      prompt_file: prompts/narrate.md
+      prompt_version: "1"
+      tools: [Read, Write]
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    inputs: [task.json]
+    outputs: [result.json]
+    next: done
+`;
+  const flowPath = join(flowRoot, 'vertical.yaml');
+  writeFileSync(flowPath, yaml, 'utf-8');
+  return flowPath;
+}
+
+/**
+ * CLI deps wired to the rate-limit-capped harness and a virtual clock, so a
+ * park's wait is instant and the test observes the real executor path.
+ */
+function parkingDeps(clock: ReturnType<typeof virtualClock>, adapter: ModelAdapter = stubAdapter): CliDeps {
+  return {
+    ...makeDeps(),
+    now: clock.now,
+    adapter,
+    harnessRegistry: createHarnessRegistry([cappedHarness]),
+    runEngine: (args: RunEngineArgs) => runExecutor({ ...args, sleep: clock.sleep }),
+  };
+}
+
+/**
+ * A fan-out shape: `plan` proposes two children that run the capped harness at
+ * `cwork`, then the parent resumes at `merge`. While the children are parked the
+ * parent sits in `awaiting_children` — scheduling, not failure.
+ */
+function writeParkingFanOutFlow(): string {
+  mkdirSync(join(flowRoot, 'prompts'), { recursive: true });
+  writeFileSync(join(flowRoot, 'prompts', 'plan.md'), 'Plan {{brief.json}}', 'utf-8');
+  writeFileSync(join(flowRoot, 'prompts', 'cwork.md'), 'Work {{children.json}}', 'utf-8');
+  const yaml = `flow: fanout-vertical
+flow_version: 1
+project_root: .
+budgets:
+  run: { wall_clock_minutes: 0.001, max_tokens: 100000 }
+  per_card: { max_execution_attempts: 5 }
+defaults: { cap_policy: scrap, on_dep_scrap: hold }
+terminal_lanes: [done, scrap, hold]
+security:
+  bash:
+    allow: ["true"]
+stations:
+  - id: plan
+    worker:
+      kind: transform
+      model: test-model
+      prompt_file: prompts/plan.md
+      prompt_version: "1"
+      output_schema: { fields: [{ name: children, type: object, required: true }] }
+    inputs: [brief.json]
+    outputs: [children.json]
+    fan_out: 2
+    child_entry: cwork
+    child_terminal: done
+    resume_at: merge
+    next: merge
+  - id: cwork
+    worker:
+      kind: harness
+      harness: fake-harness
+      model: sonnet
+      prompt_file: prompts/cwork.md
+      prompt_version: "1"
+      tools: [Read, Write]
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    inputs: [children.json]
+    outputs: [result.json]
+    wip: 2
+    next: done
+  - id: merge
+    worker: { kind: deterministic, command: "true" }
+    next: done
+`;
+  const flowPath = join(flowRoot, 'fanout.yaml');
+  writeFileSync(flowPath, yaml, 'utf-8');
+  return flowPath;
+}
+
+/** The plan station's model call: a two-child proposal with disjoint ownership. */
+const proposalAdapter: ModelAdapter = {
+  async call() {
+    const children = [
+      { id: 'c1', depends_on: [], owned_paths: ['out/c1.json'] },
+      { id: 'c2', depends_on: [], owned_paths: ['out/c2.json'] },
+    ];
+    return { text: JSON.stringify({ children }), inputTokens: 1, outputTokens: 1, costUsd: 0 };
+  },
+};
+
+/**
+ * The single card of `runId`, read raw. `attempt` and `release_at` are the two
+ * fields a park must move together: the gate is stamped, the attempt is not
+ * spent.
+ */
+function parkedCard(runId: string): { lane: string; status: string; attempt: number; release_at: number | null } {
+  return db
+    .getStateDb()
+    .prepare('SELECT lane, status, attempt, release_at FROM cards WHERE run_id = $r')
+    .get({ $r: runId }) as { lane: string; status: string; attempt: number; release_at: number | null };
+}
+
+describe('issue #7 — cmdRun records a rate-limit park as halted/parked, not a failure', () => {
+  it('leaves the card parked, stamps outcome=parked, and prints the gate time + resume command', async () => {
+    const flowPath = writeParkingFlow();
+    const clock = virtualClock();
+
+    const code = await main(['run', flowPath, '--run-id', 'job-park', '--input-inline', '{"task":"x"}'], parkingDeps(clock));
+
+    // Exit 1 keeps its documented meaning — the run did not complete.
+    expect(code).toBe(1);
+    // `halted` keeps the run in the resume sweep; `parked` says why it stopped.
+    expect(runRow('job-park')).toEqual({ status: 'halted', outcome: 'parked' });
+    // The card is exactly as the executor parked it: nothing scrapped, no attempt spent.
+    const card = parkedCard('job-park');
+    expect(card.lane).toBe('narrate');
+    expect(card.status).toBe('ready');
+    expect(card.attempt).toBe(0);
+    expect(card.release_at).toBeGreaterThan(clock.now());
+    // The operator learns WHEN and HOW to continue, not that N cards "did not
+    // reach done". (The executor's own andon line also says "parked"; the
+    // CLI's notice is the one that carries the resume command.)
+    const notice = io.errors.find((l) => l.startsWith('run "job-park" parked'));
+    expect(notice).toBeDefined();
+    expect(notice).toContain(new Date(card.release_at! * 1000).toISOString());
+    expect(notice).toContain(`conduit resume ${flowPath} --run job-park`);
+    expect(io.errors.some((l) => /did not reach done/.test(l))).toBe(false);
+  });
+
+  it('cmdResume re-parks the same way when the cap is still in force', async () => {
+    const flowPath = writeParkingFlow();
+    const clock = virtualClock();
+    await main(['run', flowPath, '--run-id', 'job-repark', '--input-inline', '{"task":"x"}'], parkingDeps(clock));
+    expect(runRow('job-repark')?.outcome).toBe('parked');
+    io.errors.length = 0;
+
+    await main(['resume', '--run', 'job-repark', flowPath], parkingDeps(clock));
+
+    expect(runRow('job-repark')).toEqual({ status: 'halted', outcome: 'parked' });
+    const card = parkedCard('job-repark');
+    expect(card.status).toBe('ready');
+    expect(card.attempt).toBe(0);
+    const notice = io.errors.find((l) => l.startsWith('run "job-repark" parked'));
+    expect(notice).toContain(`conduit resume ${flowPath} --run job-repark`);
+  });
+
+  it('a fan-out whose children park is PARKED — the awaiting parent is scheduling, not failure', async () => {
+    const flowPath = writeParkingFanOutFlow();
+    const clock = virtualClock();
+
+    const code = await main(
+      ['run', flowPath, '--run-id', 'job-fan', '--input-inline', '{"brief":"x"}'],
+      parkingDeps(clock, proposalAdapter),
+    );
+
+    expect(code).toBe(1);
+    const cards = db
+      .getStateDb()
+      .prepare('SELECT id, lane, status, release_at FROM cards WHERE run_id = $r ORDER BY id')
+      .all({ $r: 'job-fan' }) as { id: string; lane: string; status: string; release_at: number | null }[];
+    // The parent waits on its children; both children are parked at the harness station.
+    expect(cards.find((c) => c.id === 'entry-job-fan')?.status).toBe('awaiting_children');
+    const children = cards.filter((c) => c.lane === 'cwork');
+    expect(children).toHaveLength(2);
+    for (const child of children) {
+      expect(child.status).toBe('ready');
+      expect(child.release_at).toBeGreaterThan(clock.now());
+    }
+    // Before this, the awaiting parent made the run read as a plain halt.
+    expect(runRow('job-fan')).toEqual({ status: 'halted', outcome: 'parked' });
+    const soonest = Math.min(...children.map((c) => c.release_at!));
+    const notice = io.errors.find((l) => l.startsWith('run "job-fan" parked'));
+    expect(notice).toContain(new Date(soonest * 1000).toISOString());
+    expect(io.errors.some((l) => /did not reach done/.test(l))).toBe(false);
+  });
+
+  it('`run status` and an idempotent re-submit both report the parked state', async () => {
+    const flowPath = writeParkingFlow();
+    const clock = virtualClock();
+    await main(['run', flowPath, '--run-id', 'job-status', '--input-inline', '{"task":"x"}'], parkingDeps(clock));
+    const iso = new Date(parkedCard('job-status').release_at! * 1000).toISOString();
+
+    io.lines.length = 0;
+    expect(await main(['run', 'status', '--run', 'job-status'], parkingDeps(clock))).toBe(0);
+    expect(io.lines.join('\n')).toMatch(/parked/);
+    expect(io.lines.join('\n')).toContain(iso);
+
+    // Re-submitting the identical run is the existing-run path: same report.
+    io.lines.length = 0;
+    await main(['run', flowPath, '--run-id', 'job-status', '--input-inline', '{"task":"x"}'], parkingDeps(clock));
+    expect(io.lines.join('\n')).toMatch(/parked/);
+    expect(io.lines.join('\n')).toContain(`conduit resume ${flowPath} --run job-status`);
   });
 });

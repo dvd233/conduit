@@ -18,7 +18,8 @@ import type { Lane, StationOutput } from '../types/kernel';
 import { DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
 import type { ModelAdapter } from '../worker/adapter';
 import { runTransformStation, coerciveParse, type OutputSchema } from '../worker/transform';
-import type { HarnessAdapter, MountedInput } from '../worker/harness-adapter';
+import type { HarnessAdapter, HarnessResult, MountedInput, UsageReport } from '../worker/harness-adapter';
+import { usageFromThrow } from '../worker/harness-adapter';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -57,10 +58,41 @@ export interface GateConfig {
   validBackEdges: ReadonlyArray<{ from: string; to: string }>;
 }
 
+/**
+ * What an AGENTIC (harness) critic invocation actually consumed.
+ *
+ * Carried on EVERY GateDecision branch — including the failure branches —
+ * because a critic that timed out or returned a garbled verdict was still
+ * billed for the work it did, and the executor must fold that spend into the
+ * run and wave budgets regardless of whether the verdict was usable (issue
+ * #26 AC5).
+ *
+ * ONLY `runHarnessGateCheck` (the agentic critic) populates this.
+ * `runGateCheck` (the transform critic) never does, and that asymmetry is
+ * deliberate, not an oversight to "fix" later: a transform critic's usage is
+ * ALREADY folded into the run budget by the time this module sees it — it
+ * flows through `runTransformStation`, which calls the adapter, which in
+ * production is the executor's `trackingAdapter` wrapper that adds every call
+ * to `tokensSpent`. Populating `criticUsage` there too would make the
+ * executor count that same spend a second time. `criticUsage` is the
+ * HARNESS-only channel precisely because that's the one path with no other
+ * accumulator watching it.
+ */
+export interface CriticUsage {
+  /** Adapter that ran the critic (the journal's `adapter` column). */
+  adapterName: string;
+  /** Effective model the invocation was told to use, when one was resolved. */
+  model?: string;
+  /** Wall-clock duration of the invoke(), in milliseconds. */
+  durationMs: number;
+  /** The adapter's own report. `{ unknown: true }` stays unknown, never zero. */
+  usage: UsageReport;
+}
+
 export type GateDecision =
-  | { action: 'pass'; output: StationOutput<GateCriticVerdict> }
-  | { action: 'reject'; returnTo: Lane; output: StationOutput<GateCriticVerdict> }
-  | { action: 'invalid_verdict'; reason: 'invalid_return_to' }
+  | { action: 'pass'; output: StationOutput<GateCriticVerdict>; criticUsage?: CriticUsage }
+  | { action: 'reject'; returnTo: Lane; output: StationOutput<GateCriticVerdict>; criticUsage?: CriticUsage }
+  | { action: 'invalid_verdict'; reason: 'invalid_return_to'; criticUsage?: CriticUsage }
   /**
    * a pre-public engine review (@queso, findings 1 + 2a): `reason` is a NAMED failure class,
    * not a single catch-all. `runGateCheck` (transform critic) still always
@@ -71,7 +103,7 @@ export type GateDecision =
    * convention in executor.ts) so a failure names its own suspect instead of
    * forcing a blind bisect across models.
    */
-  | { action: 'scrapped'; reason: string };
+  | { action: 'scrapped'; reason: string; criticUsage?: CriticUsage };
 
 // ---------------------------------------------------------------------------
 // computeFindingsHash — deterministic, order-insensitive
@@ -226,6 +258,14 @@ export interface HarnessGateConfig {
   criticInputScope: string[];
   projectRoot: string;
   timeoutMs: number;
+  /**
+   * Resolved EFFECTIVE model for this invocation (station override or
+   * adapter default, FR-10) — resolved by the CALLER, not here, mirroring
+   * `effectiveModel` on the harness MAKER path (executor.ts). Omitted
+   * entirely means "let the adapter fall through to its own configured
+   * default," never coerced to a placeholder.
+   */
+  model?: string;
   onReject: Lane;
   validBackEdges: ReadonlyArray<{ from: string; to: string }>;
   /**
@@ -278,20 +318,47 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
 
   const verdictPath = join(config.projectRoot, HARNESS_CRITIC_VERDICT_FILE);
 
+  let result: HarnessResult;
+  const invokeStartedAt = Date.now();
   try {
-    await config.harnessAdapter.invoke({
+    result = await config.harnessAdapter.invoke({
       prompt: config.prompt,
       inputs: mountedInputs,
       tools: config.tools ?? [],
       timeoutMs: config.timeoutMs,
+      ...(config.model !== undefined ? { model: config.model } : {}),
     });
   } catch (err) {
     // A thrown invocation (timeout/nonzero-exit/untagged) never yields a
     // usable verdict — scrap rather than silently pass or hang the gate.
     // a pre-public engine review (@queso finding 1): named distinctly from every other
     // failure below — the invocation itself never ran to completion.
-    return { action: 'scrapped', reason: `harness-critic-invoke-failed: ${(err as Error).message ?? String(err)}` };
+    //
+    // issue #26 AC5: a thrown invocation was still billed for whatever it did
+    // before it died. usageFromThrow is the ONE reader for usage attached to a
+    // harness throw — never cast and reach for `.usage` directly here.
+    return {
+      action: 'scrapped',
+      reason: `harness-critic-invoke-failed: ${(err as Error).message ?? String(err)}`,
+      criticUsage: {
+        adapterName: config.harnessAdapter.name,
+        ...(config.model !== undefined ? { model: config.model } : {}),
+        durationMs: Date.now() - invokeStartedAt,
+        usage: usageFromThrow(err) ?? { unknown: true },
+      },
+    };
   }
+
+  // issue #26 AC1/AC5: the invoke() resolved (successfully or not, verdict-
+  // wise) — the adapter's usage report is real and billed either way, so
+  // build criticUsage ONCE here and carry it onto every return path below,
+  // including every harness-critic-* scrap.
+  const criticUsage: CriticUsage = {
+    adapterName: config.harnessAdapter.name,
+    ...(config.model !== undefined ? { model: config.model } : {}),
+    durationMs: Date.now() - invokeStartedAt,
+    usage: result.usage,
+  };
 
   // a pre-public engine review (@queso finding 1): a MISSING verdict file (the critic
   // never wrote one this attempt — including the WI-570 stale-verdict clear
@@ -301,12 +368,12 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
   try {
     verdictText = readFileSync(verdictPath, 'utf-8');
   } catch {
-    return { action: 'scrapped', reason: `harness-critic-verdict-missing: ${verdictPath}` };
+    return { action: 'scrapped', reason: `harness-critic-verdict-missing: ${verdictPath}`, criticUsage };
   }
 
   const payload = coerciveParse(verdictText);
   if (payload === null) {
-    return { action: 'scrapped', reason: `harness-critic-verdict-unparseable: ${verdictPath}` };
+    return { action: 'scrapped', reason: `harness-critic-verdict-unparseable: ${verdictPath}`, criticUsage };
   }
 
   const validated = gateCriticSchema.validate(payload);
@@ -319,7 +386,7 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
     const reason = isRejectWithoutFindings(rawObj)
       ? `harness-critic-reject-without-findings: ${verdictPath} — ${REJECT_WITHOUT_FINDINGS_ERROR}`
       : `harness-critic-verdict-invalid: ${verdictPath}: ${validated.error}`;
-    return { action: 'scrapped', reason };
+    return { action: 'scrapped', reason, criticUsage };
   }
   const verdict = validated.value;
 
@@ -328,9 +395,9 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
       payload: verdict,
       findings_hash: computeFindingsHash([]),
       return_to: null,
-      usage: { tokens: 0, cost: 0 },
+      usage: result.usage,
     };
-    return { action: 'pass', output };
+    return { action: 'pass', output, criticUsage };
   }
 
   const returnTo: Lane = verdict.return_to ?? config.onReject;
@@ -338,14 +405,14 @@ export async function runHarnessGateCheck(config: HarnessGateConfig): Promise<Ga
     (e) => e.from === config.station && e.to === returnTo,
   );
   if (!isValidEdge) {
-    return { action: 'invalid_verdict', reason: 'invalid_return_to' };
+    return { action: 'invalid_verdict', reason: 'invalid_return_to', criticUsage };
   }
 
   const output: StationOutput<GateCriticVerdict> = {
     payload: verdict,
     findings_hash: computeFindingsHash(verdict.findings),
     return_to: returnTo,
-    usage: { tokens: 0, cost: 0 },
+    usage: result.usage,
   };
-  return { action: 'reject', returnTo, output };
+  return { action: 'reject', returnTo, output, criticUsage };
 }

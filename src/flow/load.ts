@@ -487,8 +487,19 @@ function buildStationConfig(
     };
     // WI-442: preserve the critic's human-readable role label (omit when absent).
     if (chk.critic.role !== undefined) gateCheck.criticRole = chk.critic.role;
-    // WI-570: an agentic (harness) critic — mutually exclusive in practice
-    // with a meaningful criticModel (omit when absent, never a false '').
+    // WI-570: an agentic (harness) critic (omit when absent, never a false '').
+    //
+    // criticModel is NOT mutually exclusive with this, despite what this
+    // comment used to claim. Issue #26 AC4 made a harness critic's model
+    // meaningful: check.critic.model now reaches HarnessInvocation.model with
+    // station-over-adapter precedence (FR-10), exactly as the maker path's
+    // `stationConfig.model ?? harnessAdapter.model` does. Declaring both is
+    // the SUPPORTED way to pin a critic to a specific model while letting the
+    // adapter supply the deployment default everywhere else.
+    //
+    // Note the '' sentinel above: an absent critic model is the EMPTY STRING,
+    // not undefined, so the precedence check downstream must treat '' as
+    // absent — `criticModel ?? adapter.model` would wrongly pick ''.
     if (chk.critic.harness !== undefined) gateCheck.criticHarness = chk.critic.harness;
     // WI-595: the critic's tools allowlist, threaded to its harness invocation.
     if (chk.critic.tools !== undefined) gateCheck.criticTools = chk.critic.tools;

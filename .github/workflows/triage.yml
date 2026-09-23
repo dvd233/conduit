@@ -1,0 +1,275 @@
+# Automated issue triage — classify, scan for prompt injection, label.
+#
+# THREAT MODEL. This workflow is the inverse of pr-review.yml. A fork PR arrives
+# with no secrets and a read-only token, so pr-review.yml has to opt IN to
+# privilege. An `issues: opened` run arrives with full secrets and a write token
+# by DEFAULT, and its input is anonymous: no fork, no branch, no approval, no
+# review. There is no contributor code to execute here, so the classic CI
+# supply-chain threat is absent. What remains is prompt injection against a
+# context that is already privileged.
+#
+# The control is NOT the injection scan. The control is that the model fills in
+# fields whose legal values were fixed in advance, and a deterministic station
+# (src/triage/apply-triage.ts, unit-tested in the REQUIRED `tests` job) maps
+# those fields onto a closed label allowlist. A successful injection costs one
+# wrong label. The scan is a second, independent signal on top of that.
+#
+# BLAST RADIUS OF A LABEL WRITE = the union of every workflow triggered by
+# `labeled`. That union is NO LONGER EMPTY: pr-review-fork.yml runs the Nitpick
+# reviewer when the `nitpick` label is applied. Anyone adding a label-triggered
+# workflow is handing this model a new capability — check here first, and add
+# it to the list below.
+#
+#   pr-review-fork.yml — label `nitpick`. NOT reachable from this model, twice
+#     over: `nitpick` is outside TYPE_VALUES (apply-triage.ts:57), which is
+#     what bounds `apply`; and that workflow independently requires the
+#     labeller's login to appear in its LABELLERS allowlist, which
+#     github-actions[bot] does not and cannot add itself to. Adding `nitpick`
+#     to TYPE_VALUES would break the first of those; the second would still
+#     hold, which is why it exists.
+#
+# (release.yml and docker.yml mention only Docker OCI image labels, which are
+# unrelated to GitHub issue labels.)
+#
+# TWO RATE GUARDS, both checked BEFORE the image pull and the model calls:
+#   1. Once per issue. `opened` already fires once, but a maintainer can re-run
+#      a job and a future trigger could be added, so the real guard is a marker
+#      comment on the issue itself. GitHub is the only state that survives
+#      between runs — the engine's own outbox/idempotency key is scoped to a
+#      run, and this runner's volume is discarded with it.
+#   2. Daily cap. Actions has no built-in per-day limit, so count the triage
+#      ARTIFACTS created today — i.e. runs that actually did work — and bail
+#      over TRIAGE_DAILY_CAP. Counting artifacts rather than workflow runs
+#      matters: a run gated out by the job `if` costs no cap slot, so PR events
+#      that triage ignores cannot starve the ones it handles.
+#
+# BOTH GUARDS FAIL CLOSED. When either one cannot read what it needs to decide
+# (a GitHub API error, an unparseable response), the job SKIPS: the submission
+# is left untriaged for a human rather than triaged twice or past the cap. The
+# outcome is a skip, never a red job, so an API blip does not look like a
+# broken workflow.
+#
+# DRY RUN BY DEFAULT. The job applies nothing until repository variable
+# TRIAGE_APPLY is set to '1'. Burn in against real issues and read the job
+# summary first, matching the burn-in-then-promote pattern in blackbox.yml and
+# docs.yml.
+name: Issue Triage
+
+on:
+  issues:
+    # `opened` ONLY. `edited` would hand an attacker a free re-run button and
+    # let them iterate on injection attempts against these prompts until one
+    # lands. `issue_comment` is worse: any account, any issue, unbounded.
+    types: [opened]
+  pull_request_target:
+    # pull_request_target runs in BASE-repo context, so a fork PR gets the
+    # write token this job needs to label. Its usual danger is executing fork
+    # code with that privilege — not possible here: this job checks out
+    # NOTHING and runs a prebuilt image, so there is no fork code in reach.
+    # NEVER add actions/checkout with `ref: ...head.sha` to this workflow.
+    types: [opened]
+
+# One run per issue; a duplicate event supersedes rather than stacks.
+concurrency:
+  group: triage-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # Model ids live in triage/flow.yaml as literals; changing one is a PR.
+  TRIAGE_IMAGE: ghcr.io/${{ github.repository_owner }}/conduit-triage:main
+
+jobs:
+  triage:
+    # ALL issues, OUTSIDE PRs only.
+    #
+    # Issues: every one gets labelled, whoever opened it. A maintainer filing
+    # an issue wants it sorted onto the board the same as anyone else.
+    #
+    # PRs: fork-authored and non-insider only. This is the exact complement of
+    # pr-review.yml's gate (`head.repo.fork == false`): Nitpick reviews
+    # internal branches, triage labels fork PRs, and neither runs on the
+    # other's input. A maintainer's own branch needs neither.
+    #
+    # author_association is computed by GitHub from the actor's standing in
+    # this repo, not from anything the submitter controls.
+    if: >-
+      github.event_name == 'issues'
+      ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.head.repo.fork == true &&
+       !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                 github.event.pull_request.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Labels and comments, nothing else. Explicitly NOT contents — this job
+      # checks out nothing, the flow ships inside the pulled image.
+      # `pull-requests: write` is required because a comment on a PR is not
+      # covered by `issues: write`; apply-triage.ts still only ever POSTs to
+      # the labels and comments endpoints, which is what bounds this.
+      issues: write
+      pull-requests: write
+      # Counting this workflow's own runs for the daily cap. Read-only.
+      actions: read
+    steps:
+      - name: Rate guards
+        id: guards
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number || github.event.pull_request.number }}
+          DAILY_CAP: ${{ vars.TRIAGE_DAILY_CAP || '25' }}
+        run: |
+          set -euo pipefail
+          skip() { echo "proceed=false" >> "$GITHUB_OUTPUT"; echo "reason=$1" >> "$GITHUB_OUTPUT"; echo "SKIP: $1"; exit 0; }
+
+          # BOTH GUARDS FAIL CLOSED. A guard that cannot read its own input has
+          # not passed, it has failed to run, and the two are only the same if
+          # you squint. Neither `gh api` failing nor `jq` failing may be read as
+          # "no marker found" or "zero runs today": during a GitHub API outage
+          # that reading turns every retry into another full triage, so the
+          # first thing to break would spend model budget posting duplicate
+          # comments on issues already triaged. Capturing each response into a
+          # variable, separately from the parse, is what makes the failure
+          # visible: inside `if <pipeline>` or with `|| echo 0`, set -e and
+          # pipefail are both suspended and every error reads as a clean miss.
+          #
+          # Guard 1 — already triaged. Matches the marker apply-triage.ts writes
+          # (TRIAGE_MARKER). In dry run no comment is posted, so no marker
+          # exists and re-runs are free, which is what burn-in wants.
+          if ! comments=$(gh api "repos/$REPO/issues/$ISSUE/comments" --paginate --jq '.[].body'); then
+            skip "could not read comments on #$ISSUE (GitHub API error) — refusing to risk a duplicate triage"
+          fi
+          if printf '%s' "$comments" | grep -qF '<!-- conduit-triage -->'; then
+            skip "issue #$ISSUE already has a triage comment"
+          fi
+
+          # Guard 2 — daily cap. Counts triage artifacts created since 00:00
+          # UTC, NOT workflow runs. A run gated out by the job-level `if`
+          # (a maintainer's own PR, or any non-fork PR) produces no artifact,
+          # so it costs no cap slot — counting runs instead would let branch
+          # activity starve the submissions this workflow exists to serve.
+          #
+          # The current run is not yet counted (its artifact uploads at the
+          # end), so the comparison is >= and the cap is exact. Soft in one
+          # direction only: genuinely concurrent runs can race past it.
+          today=$(date -u +%Y-%m-%d)
+          if ! artifacts=$(gh api --paginate --slurp "repos/$REPO/actions/artifacts?per_page=100"); then
+            skip "could not list artifacts (GitHub API error) — cannot verify the daily cap"
+          fi
+          if ! count=$(printf '%s' "$artifacts" | jq "[.[].artifacts[]
+                   | select(.name | startswith(\"triage-\"))
+                   | select(.created_at >= \"$today\")] | length"); then
+            skip "could not parse the artifact list — cannot verify the daily cap"
+          fi
+          # A non-numeric count is a parse that succeeded on the wrong shape.
+          case "$count" in
+            ''|*[!0-9]*) skip "artifact count '$count' is not a number — cannot verify the daily cap" ;;
+          esac
+          echo "triage runs today: $count / cap $DAILY_CAP"
+          if [ "$count" -ge "$DAILY_CAP" ]; then
+            skip "daily cap reached ($count >= $DAILY_CAP) — #$ISSUE left untriaged"
+          fi
+
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          echo "reason=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Build entry artifact
+        if: steps.guards.outputs.proceed == 'true'
+        env:
+          # Passed through the environment, never interpolated into the shell.
+          # `${{ github.event.issue.body }}` inline in a run: block is a script
+          # injection: a body containing a backtick or $(...) would execute.
+          ISSUE_TITLE: ${{ github.event.issue.title || github.event.pull_request.title }}
+          ISSUE_BODY: ${{ github.event.issue.body || github.event.pull_request.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          # Issues and PRs warrant different type labels, so the classifier is
+          # told which it is rather than left to infer it.
+          ITEM_KIND: ${{ github.event_name == 'issues' && 'issue' || 'pull_request' }}
+        run: |
+          set -euo pipefail
+          # Only these four fields reach the model. No author, no association, no
+          # repo metadata — nothing the prompt does not need.
+          jq -n --arg t "$ISSUE_TITLE" --arg b "$ISSUE_BODY" --argjson n "$ISSUE_NUMBER" \
+                --arg k "$ITEM_KIND" \
+            '{kind:$k, title:$t, body:$b, number:$n}' > issue.json
+
+      - name: Pull triage image
+        if: steps.guards.outputs.proceed == 'true'
+        # Published by docker.yml on every push to main. Public image, so no
+        # registry login and no PAT — the cross-org read:packages PAT that
+        # pr-review.yml needs has no equivalent here.
+        run: docker pull "$TRIAGE_IMAGE"
+
+      - name: Run triage flow
+        if: steps.guards.outputs.proceed == 'true'
+        env:
+          CONDUIT_API_KEY: ${{ secrets.TRIAGE_API_KEY }}
+          CONDUIT_BASE_URL: ${{ vars.TRIAGE_BASE_URL }}
+          TRIAGE_APPLY: ${{ vars.TRIAGE_APPLY == '1' && '1' || '0' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # create -> cp-in -> start -> cp-out -> rm, the pattern pr-review.yml
+          # documents: the image bakes the flow at /flow, so a project-root bind
+          # mount would shadow it.
+          cid=$(docker create \
+            -v conduit_triage_data:/data \
+            -e CONDUIT_API_KEY -e CONDUIT_BASE_URL \
+            -e TRIAGE_APPLY -e GITHUB_TOKEN \
+            -e GITHUB_REPOSITORY="${{ github.repository }}" \
+            -e ISSUE_NUMBER="${{ github.event.issue.number || github.event.pull_request.number }}" \
+            "$TRIAGE_IMAGE" run /flow/flow.yaml --input /tmp/issue.json)
+
+          # The input goes to /tmp, NOT /flow: `docker cp` creates root-owned
+          # files, and `conduit run --input` re-writes the input as the entry
+          # artifact into the project root. Overwriting a root-owned
+          # /flow/issue.json as the non-root `conduit` user is an EACCES. Fed
+          # from /tmp, the engine creates /flow/issue.json with right ownership.
+          docker cp issue.json "$cid:/tmp/issue.json"
+
+          rc=0; docker start -a "$cid" | tee run.log || rc=$?
+          for f in triage.json scan.json result.json; do
+            docker cp "$cid:/flow/$f" "$f" 2>/dev/null || echo "{}" > "$f"
+          done
+          docker rm "$cid" >/dev/null
+          exit "$rc"
+
+      - name: Report
+        if: always() && steps.guards.outputs.proceed == 'true'
+        run: |
+          # Everything below the headings is model output derived from an
+          # anonymous submission, and $GITHUB_STEP_SUMMARY is rendered as
+          # GitHub-Flavored Markdown. A line of three backticks inside run.log
+          # (which carries apply-triage.ts's raw comment preview) would close
+          # the fence this step opened and let the rest render as markdown
+          # addressed to the maintainer reading the summary. Neutralise every
+          # backtick run on the way in, the same substitution and for the same
+          # reason as `fence()` in src/triage/apply-triage.ts.
+          defuse() { sed "s/\`\{3,\}/'''/g" "$1" 2>/dev/null || true; }
+          {
+            echo "## Triage — #${{ github.event.issue.number || github.event.pull_request.number }} (${{ github.event_name }})"
+            echo "Mode: \`${{ vars.TRIAGE_APPLY == '1' && 'APPLY' || 'DRY RUN' }}\`"
+            echo "Guards: \`${{ steps.guards.outputs.reason }}\`"
+            for f in triage.json scan.json result.json; do
+              echo; echo "### $f"; echo '```json'
+              if [ -s "$f" ]; then defuse "$f"; else echo '{}'; fi
+              echo '```'
+            done
+            echo; echo "### run log (includes the halted-run card summary)"; echo '```'
+            tail -200 run.log 2>/dev/null | sed "s/\`\{3,\}/'''/g" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload triage artifacts
+        if: always() && steps.guards.outputs.proceed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: triage-${{ github.event.issue.number || github.event.pull_request.number }}
+          path: |
+            issue.json
+            triage.json
+            scan.json
+            result.json
+            run.log
+          retention-days: 14

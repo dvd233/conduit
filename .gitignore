@@ -41,3 +41,6 @@ project.yaml
 
 # local package-manager credentials
 .npmrc
+
+# A(i)-Team observer scratch log (maintainer-only plugin artifact, never committed)
+.ateam-observer-failures.log

@@ -1,0 +1,51 @@
+# Paths where a review is not optional.
+#
+# This file is INERT on its own. It has teeth only once the ruleset on `main`
+# turns on "require review from Code Owners" — without that it is documentation.
+# See the repository-settings commands in the pull-request review workflow.
+#
+# Two groups, for two different reasons.
+
+# ---------------------------------------------------------------------------
+# PRIVILEGED — runs outside any sandbox, on a maintainer's machine or in CI
+# with real secrets. scripts/ and .githooks/ execute at commit time via
+# core.hooksPath; .github/ decides what every other check is even allowed to
+# do; package.json and bun.lock choose the code that `bun install` fetches.
+# ---------------------------------------------------------------------------
+/.github/          @queso
+/.githooks/        @queso
+/scripts/          @queso
+/package.json      @queso
+/bun.lock          @queso
+/Dockerfile        @queso
+/.dockerignore     @queso
+/docker-compose*   @queso
+
+# ---------------------------------------------------------------------------
+# MODEL-FACING — becomes a prompt, a skill, or a flow definition. These are not
+# executed, so no sandbox, allowlist or scanner has anything useful to say
+# about them: the attack is text that redirects a model at run time, and in a
+# diff it reads as ordinary prose. A human who knows what the prompt is FOR is
+# the only control that works.
+#
+# triage/ is the sharpest: .github/workflows/triage.yml runs that flow against
+# real issues with an `issues: write` token, from the `:main` image tag, which
+# docker.yml rebuilds on every push to main. A merge here goes live with no
+# further gate.
+# ---------------------------------------------------------------------------
+/triage/           @queso
+/examples/         @queso
+/fixtures/         @queso
+*.flow.yaml        @queso
+**/prompts/        @queso
+**/SKILL.md        @queso
+
+# ---------------------------------------------------------------------------
+# NORMATIVE — SPEC.md states what the kernel must do, and CLAUDE.md is what
+# steers every agent session. drift.lock records who last vouched for which
+# prose; a diff that re-signs an anchor while changing no prose is the thing
+# to look at.
+# ---------------------------------------------------------------------------
+/SPEC.md           @queso
+/CLAUDE.md         @queso
+/drift.lock        @queso

@@ -19,7 +19,8 @@
  *      channel, fires the alert seam, and appends a 'spawn_failed' log entry.
  *   7. After a successful launch the child's EXIT is handled off the request
  *      path (watchChildExit): a non-zero exit gets the same FR-7 treatment as a
- *      failed launch, and the run slot is released there.
+ *      failed launch — unless the run PARKED behind a provider rate limit
+ *      (issue #7, ./parked.ts) — and the run slot is released there.
  *
  * Launch vs exit (the original acknowledgement-on-accept work). The seam resolves when the child is LAUNCHED, not
  * when it finishes; it reports the child's terminal state through the optional
@@ -39,6 +40,7 @@
  * persistence and envelope logic uses the real modules (WI-401, WI-403, WI-404).
  */
 import { buildEnvelope, projectSubstrate } from './envelope';
+import { inspectParkedRun, recordPark } from './parked';
 import { deriveIngressRunId } from './run-id';
 import type { RunSlots } from './run-slots';
 import type { ConduitDB } from '../persistence/db';
@@ -112,6 +114,11 @@ export interface SpawnPathDeps {
    * a slot frees.
    */
   slots?: RunSlots;
+  /**
+   * Listener clock, unix MILLISECONDS (issue #7): the exit watcher reads it to
+   * confirm a parked run against its cards. Defaults to Date.now.
+   */
+  now?: () => number;
 }
 
 export interface SpawnPathInput {
@@ -153,7 +160,7 @@ export async function runSpawnPath(
   deps: SpawnPathDeps,
   input: SpawnPathInput,
 ): Promise<SpawnPathResult> {
-  const { db, spawn, alert, globalAlertChannel, redriveCap, slots } = deps;
+  const { db, spawn, alert, globalAlertChannel, redriveCap, slots, now = Date.now } = deps;
   const {
     source,
     eventId,
@@ -273,8 +280,8 @@ export async function runSpawnPath(
       if (spawnResult.exited !== undefined) {
         slotHandedOff = true;
         void watchChildExit(
-          { db, alert, globalAlertChannel, ...(slots !== undefined && { slots }) },
-          { source, eventId, flowId, flow },
+          { db, alert, globalAlertChannel, now, ...(slots !== undefined && { slots }) },
+          { source, eventId, runId, flowId, flow },
           spawnResult.exited,
         );
       }
@@ -319,14 +326,26 @@ interface ChildExitDeps {
   db: ConduitDB;
   alert: AlertSeam;
   globalAlertChannel: string;
+  now: () => number;
   slots?: RunSlots;
 }
 
 interface ChildExitContext {
   source: string;
   eventId: string;
+  runId: string;
   flowId: string;
   flow: FlowConfig;
+}
+
+/** Tell the channel a launch died — best effort, and never rejects on its caller. */
+async function fireSpawnFailedAlert(alert: AlertSeam, notice: SpawnFailedAlert): Promise<void> {
+  try {
+    await alert(notice);
+  } catch {
+    // Alerting is best effort once the ack is gone; the 'spawn_failed' log
+    // entry is the durable record.
+  }
 }
 
 /**
@@ -337,6 +356,12 @@ interface ChildExitContext {
  * 'spawn_failed' ingress_log entry — only now the webhook has already acked, so
  * the failure surfaces through the alert and the log rather than the response.
  * A clean exit leaves the row 'spawned' and writes nothing further.
+ *
+ * A PARKED run also exits non-zero (issue #7): it did not complete, but
+ * nothing failed — it is waiting on a provider reset and the listener resumes
+ * it (ingress/parked.ts). The row stays 'spawned' (its launch succeeded, and
+ * a 'failed' row would be re-driven with a `conduit run` that is a no-op for
+ * an existing run), the log records 'parked', and the channel is told once.
  *
  * The run slot is released here: that is what keeps max_concurrent_runs meaning
  * concurrent RUNS. Release happens after the row's final state is marked, so a
@@ -351,8 +376,8 @@ async function watchChildExit(
   ctx: ChildExitContext,
   exited: Promise<SpawnExit>,
 ): Promise<void> {
-  const { db, alert, globalAlertChannel, slots } = deps;
-  const { source, eventId, flowId, flow } = ctx;
+  const { db, alert, globalAlertChannel, now, slots } = deps;
+  const { source, eventId, runId, flowId, flow } = ctx;
 
   try {
     let reason: string | null = null;
@@ -367,16 +392,22 @@ async function watchChildExit(
 
     if (reason === null) return; // clean exit — the row stays 'spawned'
 
-    db.markIngressFailed(eventId);
-
     const alertChannel = flow.channels?.egress?.[0]?.target ?? globalAlertChannel;
-    try {
-      await alert({ flowId, channel: alertChannel, eventId, reason });
-    } catch {
-      // Alerting is best effort once the ack is gone; the log entry below is
-      // the durable record of the failure.
+
+    const parked = inspectParkedRun(db, runId, Math.floor(now() / 1000));
+    if (parked !== null) {
+      await recordPark(db, alert, { source, eventId, flowId, channel: alertChannel, runId, releaseAt: parked.releaseAt });
+      return;
     }
 
+    // Mark -> start alert -> log, and the alert is NOT awaited. A transport
+    // that never SETTLES (not merely one that throws) would otherwise block the
+    // durable ingress_log entry below AND the slot release in the finally,
+    // pinning a run slot for the life of the listener — at max_concurrent_runs
+    // 1, one hung post is a listener that never launches again, with nothing in
+    // the log to say why. Same rule as watchRedrivenChildExit and recordPark.
+    db.markIngressFailed(eventId);
+    void fireSpawnFailedAlert(alert, { flowId, channel: alertChannel, eventId, reason });
     db.appendIngressLog({ source, eventId, outcome: 'spawn_failed', reason });
   } catch {
     // Persistence itself failed (disk error on the state/journal db). Nothing

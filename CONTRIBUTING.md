@@ -52,8 +52,15 @@ runs the same check as an advisory `docs` job.
 4. Run `bun test src/ --pass-with-no-tests` and `bun run typecheck`.
 5. Run `bun run test:blackbox` when changing CLI, ingress, persistence, or
    process-boundary behavior.
-6. Update documentation and `CHANGELOG.md` when behavior changes.
-7. If `drift check` reports a stale anchor, re-read the section it names and
+6. Run `bun run test:mutation` when touching harness usage accounting. It
+   deletes each `foldHarnessUsage` call site in turn and requires a named test
+   to fail; a fold site that survives deletion is unprotected no matter how
+   green the suite is. It takes about three seconds, runs in the required CI
+   gate, and `--list` explains each site. If you move or rename a fold site,
+   update the manifest in `scripts/mutation-check.ts` in the same change — a
+   stale entry fails the check rather than skipping it.
+7. Update documentation and `CHANGELOG.md` when behavior changes.
+8. If `drift check` reports a stale anchor, re-read the section it names and
    either correct the prose or re-stamp it with
    `drift link <doc> --doc-is-still-accurate`. Re-stamping asserts you read it.
 

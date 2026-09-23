@@ -356,7 +356,11 @@ describe('StationOutput / QC-verdict envelope', () => {
     // payload is the parameterized type, not `any`/`unknown` erased away.
     expect(passing.payload.approved).toBe(true);
     expect(passing.payload.notes).toBe('looks good');
-    // per-call attribution is present and numeric.
+    // per-call attribution is present and numeric. Narrowed off the
+    // unknown arm first (issue #26): a KNOWN usage and an unreported one are
+    // different facts, so reading tokens/cost requires proving which it is.
+    expect('unknown' in passing.usage).toBe(false);
+    if ('unknown' in passing.usage) throw new Error('expected known usage');
     expect(passing.usage.tokens).toBe(1280);
     expect(passing.usage.cost).toBeCloseTo(0.0192);
   });
@@ -374,6 +378,37 @@ describe('StationOutput / QC-verdict envelope', () => {
     // The gate (WI-300) compares findings_hash across attempts — it must be a stable string.
     expect(typeof failing.findings_hash).toBe('string');
     expect(failing.findings_hash).not.toBe('');
+  });
+
+  // Issue #26 AC2: an adapter that cannot report usage for a call must stay
+  // distinguishable from one that reported a genuine zero. Before the union,
+  // the only representable answer was `{ tokens: 0, cost: 0 }` — so an
+  // unmeasured harness critic and a free call read identically, and every
+  // budget that folds this number silently under-counted the unmeasured one.
+  it('represents unreported usage as unknown, distinctly from a measured zero', () => {
+    const unmeasured: StationOutput<ReviewPayload> = {
+      payload: { approved: true, notes: 'critic adapter reports no usage' },
+      findings_hash: 'sha256:da39a3ee',
+      return_to: null,
+      usage: { unknown: true },
+    };
+    const measuredZero: StationOutput<ReviewPayload> = {
+      payload: { approved: true, notes: 'a genuinely free call' },
+      findings_hash: 'sha256:da39a3ee',
+      return_to: null,
+      usage: { tokens: 0, cost: 0 },
+    };
+
+    expect('unknown' in unmeasured.usage).toBe(true);
+    expect('unknown' in measuredZero.usage).toBe(false);
+
+    // And the two are not merely differently-shaped: a consumer narrowing on
+    // the discriminant reaches a different branch for each, which is the whole
+    // point — one folds into a budget, the other cannot.
+    const fold = (u: StationOutput<ReviewPayload>['usage']): number | null =>
+      'unknown' in u ? null : u.tokens;
+    expect(fold(unmeasured.usage)).toBeNull();
+    expect(fold(measuredZero.usage)).toBe(0);
   });
 });
 

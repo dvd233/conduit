@@ -17,7 +17,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openConduitDB, DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
-import { getRunState, type RunStateResult } from './run-state';
+import { getRunState, getRunParkedRelease, formatParkedRun, type RunStateResult } from './run-state';
 import type { Card } from '../types/kernel';
 
 let db: ConduitDB;
@@ -89,6 +89,7 @@ function holdCard(card: Card, reason: string): void {
   });
 }
 
+/** Move `card` to a terminal lane, so no unfinished card remains to be parked. */
 function terminalCard(card: Card, lane: 'done' | 'scrap'): void {
   const stateDb = db.getStateDb();
   stateDb
@@ -348,5 +349,245 @@ describe('getRunState — cross-run isolation (AC-5)', () => {
 
     expect(getRunState(db, DEFAULT_RUN_ID).status).toBe('terminal');
     expect(getRunState(db, 'run-custom').status).toBe('running');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #7 — a run halted only because every card is parked behind a provider
+// reset is PARKED: nothing failed, and it is resumable once the gate opens.
+// ---------------------------------------------------------------------------
+
+/**
+ * Park a ready card behind a release gate, the way the executor's rate-limit
+ * park does it: `release_at` stamped AND an `entered_lane` card_log entry
+ * classed 'rate_limited'. Both halves matter — the column alone cannot say why
+ * a card is gated, because the fan-out stagger stamps the very same column.
+ * See `staggerCard` below for the other writer.
+ */
+function parkCard(card: Card, releaseAt: number): void {
+  db.getStateDb()
+    .prepare("UPDATE cards SET status = 'ready', release_at = $at WHERE run_id = $r AND id = $id")
+    .run({ $at: releaseAt, $r: card.run_id, $id: card.id });
+  db.appendCardLog({
+    runId: card.run_id,
+    kind: 'entered_lane',
+    cardId: card.id,
+    station: card.lane,
+    attempt: card.attempt,
+    sourceLane: card.lane,
+    destLane: card.lane,
+    reasonClass: 'rate_limited',
+  });
+}
+
+/**
+ * Gate a ready card the way the v10 fan-out cache-warming stagger does: the
+ * same `release_at` column, but a lane move that is ordinary forward progress.
+ * A run holding only these is scheduled, NOT parked behind a provider cap.
+ */
+function staggerCard(card: Card, releaseAt: number): void {
+  db.getStateDb()
+    .prepare("UPDATE cards SET status = 'ready', release_at = $at WHERE run_id = $r AND id = $id")
+    .run({ $at: releaseAt, $r: card.run_id, $id: card.id });
+  db.appendCardLog({
+    runId: card.run_id,
+    kind: 'entered_lane',
+    cardId: card.id,
+    station: card.lane,
+    attempt: card.attempt,
+    sourceLane: 'plan',
+    destLane: card.lane,
+    reasonClass: 'forward',
+  });
+}
+
+describe('getRunParkedRelease — the one predicate behind outcome=parked (issue #7)', () => {
+  const NOW = 1000;
+
+  it('is parked when every unfinished card is ready behind a FUTURE release_at', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    parkCard(makeCard('r', 'c1'), NOW + 300);
+    expect(getRunParkedRelease(db, 'r', NOW)).toEqual({ releaseAt: NOW + 300 });
+  });
+
+  it('names the SOONEST gate when several cards are parked', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    db.insertCard(makeCard('r', 'c2'));
+    parkCard(makeCard('r', 'c1'), NOW + 900);
+    parkCard(makeCard('r', 'c2'), NOW + 300);
+    expect(getRunParkedRelease(db, 'r', NOW)?.releaseAt).toBe(NOW + 300);
+  });
+
+  it('ignores cards already at done — finished work is not waiting on anything', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    db.insertCard(makeCard('r', 'c2'));
+    terminalCard(makeCard('r', 'c1'), 'done');
+    parkCard(makeCard('r', 'c2'), NOW + 300);
+    expect(getRunParkedRelease(db, 'r', NOW)).toEqual({ releaseAt: NOW + 300 });
+  });
+
+  it('is NOT parked when any card was scrapped — something went wrong, not just waited', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    db.insertCard(makeCard('r', 'c2'));
+    parkCard(makeCard('r', 'c1'), NOW + 300);
+    terminalCard(makeCard('r', 'c2'), 'scrap');
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
+
+  it('is NOT parked when any card is held — a human is owed a decision first', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    db.insertCard(makeCard('r', 'c2'));
+    parkCard(makeCard('r', 'c1'), NOW + 300);
+    holdCard(makeCard('r', 'c2'), 'needs judgment');
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
+
+  it('is NOT parked when the gate is already in the PAST — a dispatchable card that stopped is a stall', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    parkCard(makeCard('r', 'c1'), NOW - 1);
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
+
+  it('is NOT parked when a card is ready with no gate at all', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
+
+  it('is NOT parked when the run is complete', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    terminalCard(makeCard('r', 'c1'), 'done');
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
+
+  it("does not read another run's parked cards", () => {
+    seedRun('a');
+    seedRun('b');
+    db.insertCard(makeCard('b', 'c1'));
+    parkCard(makeCard('b', 'c1'), NOW + 300);
+    expect(getRunParkedRelease(db, 'a', NOW)).toBeNull();
+  });
+
+  // Cards blocked on OTHER cards are scheduling, not failure: a fan-out
+  // parent waits on its children, a dependent waits on its deps. If the card
+  // they wait on is parked, the whole run is merely waiting on the provider.
+  it('is parked when a fan-out parent is awaiting_children and its child is parked — with the CHILD gate', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'root', { lane: 'plan', status: 'awaiting_children' }));
+    db.insertCard(makeCard('r', 'child', { parent_id: 'root', lane: 'cwork' }));
+    parkCard(makeCard('r', 'child'), NOW + 300);
+    expect(getRunParkedRelease(db, 'r', NOW)).toEqual({ releaseAt: NOW + 300 });
+  });
+
+  it('is parked when a waiting dependent sits behind a parked sibling', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    db.insertCard(makeCard('r', 'c2', { status: 'waiting' }));
+    parkCard(makeCard('r', 'c1'), NOW + 300);
+    expect(getRunParkedRelease(db, 'r', NOW)).toEqual({ releaseAt: NOW + 300 });
+  });
+
+  it('is NOT parked when cards wait with NOTHING scheduled — a wait on nothing is a stall', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'root', { lane: 'plan', status: 'awaiting_children' }));
+    db.insertCard(makeCard('r', 'c2', { status: 'waiting' }));
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
+
+  it.each(['claimed', 'working', 'interrupted', 'done_pending_ack'] as const)(
+    'is NOT parked while a sibling is %s — work is in flight, not waiting',
+    (status) => {
+      seedRun('r');
+      db.insertCard(makeCard('r', 'c1'));
+      db.insertCard(makeCard('r', 'c2', { status }));
+      parkCard(makeCard('r', 'c1'), NOW + 300);
+      expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+    },
+  );
+});
+
+describe('getRunParkedRelease — a gate is only a park when the card_log says so', () => {
+  const NOW = 1000;
+
+  it('is NOT parked when the only gate is a fan-out stagger, not a provider cap', () => {
+    // The halt that produced this shape was a budget blowout, and the operator
+    // has to see it as one: recording it 'parked' prints "parked behind a
+    // provider rate limit", suppresses the stuck-card summary, and hands the
+    // run to the ingress listener's unattended resume.
+    seedRun('r');
+    db.insertCard(makeCard('r', 'parent', { status: 'awaiting_children', lane: 'plan' }));
+    db.insertCard(makeCard('r', 'c1', { parent_id: 'parent' }));
+    db.insertCard(makeCard('r', 'c2', { parent_id: 'parent' }));
+    staggerCard(makeCard('r', 'c1', { parent_id: 'parent' }), NOW + 30);
+    staggerCard(makeCard('r', 'c2', { parent_id: 'parent' }), NOW + 60);
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
+
+  it('names the soonest RATE-LIMITED gate, ignoring an earlier stagger gate', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    db.insertCard(makeCard('r', 'c2'));
+    staggerCard(makeCard('r', 'c1'), NOW + 30);
+    parkCard(makeCard('r', 'c2'), NOW + 300);
+    // MIN(release_at) would say 1030 and resume the run while it is still
+    // capped; the cap is what the run is actually waiting on.
+    expect(getRunParkedRelease(db, 'r', NOW)).toEqual({ releaseAt: NOW + 300 });
+  });
+
+  it('reads the LATEST lane move — a card whose last move was forward is not parked', () => {
+    // card_log is UNIQUE(run_id, card_id, station, attempt, kind), so a second
+    // move for the same card must differ in attempt to be recorded at all.
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    parkCard(makeCard('r', 'c1'), NOW + 300);
+    staggerCard(makeCard('r', 'c1', { attempt: 1 }), NOW + 300);
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
+});
+
+describe('getRunState — parked (issue #7)', () => {
+  it('reports parked, with the gate time, when the runs row was halted as parked', () => {
+    db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    db.insertCard(makeCard('r', 'c1'));
+    parkCard(makeCard('r', 'c1'), 1300);
+    expect(getRunState(db, 'r', 1000)).toEqual({ status: 'parked', releaseAt: 1300, flow: '/flows/vertical.yaml' });
+  });
+
+  it('does NOT trust a stale parked row while a resume has cards in flight', () => {
+    // After a parked exit the row stays halted/parked until the resumed process
+    // exits. `run status` mid-resume must read the cards, not the row.
+    db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    db.insertCard(makeCard('r', 'c1', { status: 'working' }));
+    expect(getRunState(db, 'r', 1000)).toEqual({ status: 'running' });
+  });
+
+  it('does NOT report parked once the gate has passed and the card is merely ready', () => {
+    db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    db.insertCard(makeCard('r', 'c1'));
+    parkCard(makeCard('r', 'c1'), 1300);
+    expect(getRunState(db, 'r', 1300)).toEqual({ status: 'running' });
+  });
+
+  it('still reports a plain halt as terminal/held, never parked', () => {
+    db.insertRun({ run_id: 'r', flow: '/flows/vertical.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'halted' });
+    db.insertCard(makeCard('r', 'c1'));
+    terminalCard(makeCard('r', 'c1'), 'scrap');
+    expect(getRunState(db, 'r')).toEqual({ status: 'terminal', outcome: 'halted' });
+  });
+});
+
+describe('formatParkedRun — what the operator needs to come back', () => {
+  it('names the gate as ISO-8601 UTC and the exact resume command', () => {
+    const line = formatParkedRun('job-7', '/flows/vertical.yaml', 1_788_328_800);
+    expect(line).toContain('2026-09-02T06:00:00.000Z');
+    expect(line).toContain('conduit resume /flows/vertical.yaml --run job-7');
+    expect(line).toMatch(/provider rate limit/);
   });
 });

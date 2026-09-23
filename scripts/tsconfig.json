@@ -7,5 +7,10 @@
   // deleting a spike is not this change's business — but neither should the new
   // tooling stay unchecked because of it.
   "extends": "../tsconfig.json",
-  "include": ["docs-governing.ts", "docs-governing.test.ts", "docs-check.test.ts"]
+  "include": [
+    "docs-governing.ts",
+    "docs-governing.test.ts",
+    "docs-check.test.ts",
+    "mutation-check.ts"
+  ]
 }
